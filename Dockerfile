@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir -U yt-dlp
 
 COPY server.py .
+COPY cookies.txt* ./
 
 ENV PORT=10000
 EXPOSE 10000

@@ -27,6 +27,25 @@ try:
 except Exception:
     ytmusic = None
 
+COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+
+# Load cookies from YOUTUBE_COOKIES environment variable if provided
+if os.environ.get("YOUTUBE_COOKIES"):
+    try:
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            f.write(os.environ["YOUTUBE_COOKIES"].strip())
+        print(f"--- Successfully loaded YouTube cookies from environment variable ({os.path.getsize(COOKIE_FILE)} bytes) ---")
+    except Exception as e:
+        print(f"Error loading YOUTUBE_COOKIES env var: {e}")
+
+def has_cookies() -> bool:
+    return os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 30
+
+def get_cookie_args() -> list:
+    if has_cookies():
+        return ["--cookies", COOKIE_FILE]
+    return []
+
 # In-memory cache for resolved direct audio URLs (expires after 2 hours)
 import time
 url_cache = {}  # video_id -> (url, timestamp)
@@ -108,6 +127,8 @@ def extract_audio_url(video_id: str) -> str:
                 'nocheckcertificate': True,
                 'socket_timeout': 6,
             }
+            if has_cookies():
+                ydl_opts['cookiefile'] = COOKIE_FILE
             if client_list:
                 ydl_opts['extractor_args'] = {'youtube': {'player_client': client_list}}
 
@@ -225,6 +246,19 @@ def index():
     <h1>PSYTMusic Cloud Server <span class="badge">ONLINE</span></h1>
     <p>High-performance audio streaming & search server with native FFmpeg transcoding for Sony PSP.</p>
 
+    <div class="card" style="border-left: 4px solid #0070d1;">
+        <h3>YouTube Authentication (Bypass Bot Check on Render)</h3>
+        <p style="color: #bbb; font-size: 14px; margin-bottom: 12px;">
+            Render's cloud IP requires YouTube cookies to bypass <code>Sign in to confirm you're not a bot</code>.
+        </p>
+        <div id="cookieStatus" style="font-weight: bold; margin-bottom: 12px; font-size: 15px;">Checking cookie status...</div>
+        <textarea id="cookieInput" style="width: 100%; height: 90px; background: #222; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 12px; box-sizing: border-box;" placeholder="Paste exported Netscape cookies.txt here..."></textarea>
+        <div style="margin-top: 10px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+            <button onclick="saveCookies()">Save YouTube Cookies</button>
+            <span style="font-size: 13px; color: #888;">Tip: Use browser extension <strong>Get cookies.txt LOCALLY</strong> on youtube.com, click Export, and paste here.</span>
+        </div>
+    </div>
+
     <div class="card">
         <h3>Live Search & Transcode Test:</h3>
         <div style="display: flex; gap: 10px; margin-bottom: 20px;">
@@ -285,10 +319,80 @@ def index():
             player.play();
         }
 
-        window.onload = () => { doSearch(); };
+        async function checkCookieStatus() {
+            try {
+                const resp = await fetch('/cookies_status');
+                const data = await resp.json();
+                const el = document.getElementById('cookieStatus');
+                if (data.authenticated) {
+                    el.innerHTML = '<span style="color: #4af626;">&#10004; ' + data.message + '</span>';
+                } else {
+                    el.innerHTML = '<span style="color: #ff5252;">&#9888; ' + data.message + '</span>';
+                }
+            } catch (e) {
+                document.getElementById('cookieStatus').textContent = "Status: offline";
+            }
+        }
+
+        async function saveCookies() {
+            const text = document.getElementById('cookieInput').value.trim();
+            if (!text) {
+                alert('Please paste exported YouTube cookies first.');
+                return;
+            }
+            try {
+                const resp = await fetch('/save_cookies', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'text/plain' },
+                    body: text
+                });
+                const res = await resp.json();
+                alert(res.message || 'Cookies saved successfully!');
+                document.getElementById('cookieInput').value = '';
+                checkCookieStatus();
+            } catch (e) {
+                alert('Error saving cookies: ' + e);
+            }
+        }
+
+        window.onload = () => {
+            checkCookieStatus();
+            doSearch();
+        };
     </script>
 </body>
 </html>"""
+
+@app.get("/cookies_status")
+def api_cookies_status():
+    if has_cookies():
+        size = os.path.getsize(COOKIE_FILE)
+        return {
+            "authenticated": True,
+            "size": size,
+            "message": f"YouTube authentication active ({size} bytes). Bot check bypassed!"
+        }
+    return {
+        "authenticated": False,
+        "size": 0,
+        "message": "No YouTube cookies found. Bot check active on Render."
+    }
+
+@app.post("/save_cookies")
+async def api_save_cookies(request: Request):
+    try:
+        body = await request.body()
+        content = body.decode("utf-8").strip()
+        if not content:
+            raise HTTPException(status_code=400, detail="Empty cookies content")
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+        return {
+            "status": "ok",
+            "message": f"Successfully installed YouTube cookies ({len(content)} bytes). Bot check bypassed!"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/search")
 def api_search(q: str):
@@ -396,7 +500,7 @@ def stream_mp3_ytdlp_pipe(video_id: str):
             "--quiet",
             "--no-warnings",
             "--no-playlist"
-        ] + extra_args + [
+        ] + get_cookie_args() + extra_args + [
             "-f", "bestaudio[ext=m4a]/bestaudio/ba/b",
             "-o", "-",
             f"https://www.youtube.com/watch?v={video_id}"
@@ -493,7 +597,7 @@ def stream_pcm_ytdlp_pipe(video_id: str):
             "--quiet",
             "--no-warnings",
             "--no-playlist"
-        ] + extra_args + [
+        ] + get_cookie_args() + extra_args + [
             "-f", "bestaudio[ext=m4a]/bestaudio/ba/b",
             "-o", "-",
             f"https://www.youtube.com/watch?v={video_id}"
