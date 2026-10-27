@@ -1,6 +1,9 @@
 import io
 import os
 import sys
+import json
+import uuid
+import time
 import subprocess
 import urllib.parse
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -28,26 +31,96 @@ except Exception:
     ytmusic = None
 
 COOKIE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+TOKEN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "token.json")
 
-# Load cookies from YOUTUBE_COOKIES environment variable if provided
-if os.environ.get("YOUTUBE_COOKIES"):
+OAUTH_CLIENT_ID = "861556708454-d6dlm3lh05idd8npek18k6be8ba3oc68.apps.googleusercontent.com"
+OAUTH_CLIENT_SECRET = "SboVhoG9s0rNafixCSGGKXAT"
+OAUTH_SCOPES = "https://gdata.youtube.com https://www.googleapis.com/auth/youtube"
+
+def load_oauth_token() -> dict:
+    if os.environ.get("YOUTUBE_OAUTH"):
+        try:
+            return json.loads(os.environ["YOUTUBE_OAUTH"])
+        except Exception:
+            pass
+    if os.path.exists(TOKEN_FILE):
+        try:
+            with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return None
+
+def save_oauth_token(data: dict):
+    if not data:
+        return
     try:
-        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
-            f.write(os.environ["YOUTUBE_COOKIES"].strip())
-        print(f"--- Successfully loaded YouTube cookies from environment variable ({os.path.getsize(COOKIE_FILE)} bytes) ---")
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
     except Exception as e:
-        print(f"Error loading YOUTUBE_COOKIES env var: {e}")
+        print(f"Error saving {TOKEN_FILE}: {e}")
+    try:
+        ydl = yt_dlp.YoutubeDL()
+        ydl.cache.store('youtube-oauth2', 'token_data', data)
+    except Exception as e:
+        print(f"Error syncing to yt-dlp cache: {e}")
+
+# Load initial token if present in environment
+if load_oauth_token():
+    save_oauth_token(load_oauth_token())
+    print("--- Loaded YouTube OAuth credentials ---")
+
+def has_oauth() -> bool:
+    token = load_oauth_token()
+    return bool(token and token.get("access_token") and token.get("refresh_token"))
+
+def refresh_oauth_token():
+    token = load_oauth_token()
+    if not token or not token.get("refresh_token"):
+        return None
+    try:
+        resp = requests.post(
+            "https://www.youtube.com/o/oauth2/token",
+            data=json.dumps({
+                "client_id": OAUTH_CLIENT_ID,
+                "client_secret": OAUTH_CLIENT_SECRET,
+                "refresh_token": token["refresh_token"],
+                "grant_type": "refresh_token"
+            }),
+            headers={"Content-Type": "application/json", "__youtube_oauth__": "true"},
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            token["access_token"] = data["access_token"]
+            token["expires"] = time.time() + data.get("expires_in", 3600)
+            if "refresh_token" in data:
+                token["refresh_token"] = data["refresh_token"]
+            save_oauth_token(token)
+            return token
+    except Exception as e:
+        print(f"OAuth refresh error: {e}")
+    return None
 
 def has_cookies() -> bool:
     return os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 30
 
-def get_cookie_args() -> list:
+def get_auth_args() -> list:
+    if has_oauth():
+        token = load_oauth_token()
+        if token and token.get("expires", 0) < time.time() + 60:
+            token = refresh_oauth_token()
+        if token:
+            save_oauth_token(token)
+            return ["--username", "oauth2", "--password", ""]
     if has_cookies():
         return ["--cookies", COOKIE_FILE]
     return []
 
+def get_cookie_args() -> list:
+    return get_auth_args()
+
 # In-memory cache for resolved direct audio URLs (expires after 2 hours)
-import time
 url_cache = {}  # video_id -> (url, timestamp)
 CACHE_TTL = 7200
 
@@ -115,8 +188,11 @@ def extract_audio_url(video_id: str) -> str:
     except Exception as e:
         print(f"Piped proxy extract error: {e}")
 
-    # Tier 3: yt-dlp client extraction with unblocked embedded/creator clients
-    clients = [['visionos'], ['android_creator'], ['ios_creator'], ['tv_embedded'], ['android'], None]
+    # Tier 3: yt-dlp client extraction
+    if has_oauth():
+        clients = [None, ['tv_embedded'], ['android_creator']]
+    else:
+        clients = [['visionos'], ['android_creator'], ['ios_creator'], ['tv_embedded'], ['android'], None]
     for client_list in clients:
         try:
             ydl_opts = {
@@ -128,7 +204,10 @@ def extract_audio_url(video_id: str) -> str:
                 'nocheckcertificate': True,
                 'socket_timeout': 6,
             }
-            if has_cookies():
+            if has_oauth():
+                ydl_opts['username'] = 'oauth2'
+                ydl_opts['password'] = ''
+            elif has_cookies():
                 ydl_opts['cookiefile'] = COOKIE_FILE
             if client_list:
                 ydl_opts['extractor_args'] = {'youtube': {'player_client': client_list}}
@@ -230,10 +309,16 @@ def index():
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 900px; margin: 30px auto; padding: 0 20px; background: #0a0a0a; color: #f0f0f0; }
         h1 { color: #0070d1; margin-bottom: 4px; display: flex; align-items: center; gap: 10px; }
         .badge { background: #1b5e20; color: #a5d6a7; padding: 4px 10px; border-radius: 12px; font-size: 13px; font-weight: bold; }
-        .card { background: #161616; padding: 20px; border-radius: 10px; margin: 20px 0; border: 1px solid #282828; }
+        .card { background: #161616; padding: 22px; border-radius: 10px; margin: 20px 0; border: 1px solid #282828; }
         input[type=text] { width: 70%; padding: 12px 16px; font-size: 16px; border-radius: 6px; border: 1px solid #444; background: #222; color: #fff; box-sizing: border-box; }
-        button { padding: 12px 24px; font-size: 15px; border-radius: 6px; border: none; background: #0070d1; color: #fff; cursor: pointer; font-weight: bold; }
+        button { padding: 12px 24px; font-size: 15px; border-radius: 6px; border: none; background: #0070d1; color: #fff; cursor: pointer; font-weight: bold; transition: background 0.2s; }
         button:hover { background: #0088ff; }
+        .btn-google { background: #4285F4; display: inline-flex; align-items: center; gap: 10px; }
+        .btn-google:hover { background: #3367D6; }
+        .btn-danger { background: #c62828; }
+        .btn-danger:hover { background: #b71c1c; }
+        .code-box { font-size: 26px; font-family: monospace; font-weight: bold; background: #000; border: 2px dashed #4285F4; color: #64b5f6; padding: 10px 20px; border-radius: 8px; letter-spacing: 3px; display: inline-block; margin: 10px 0; }
+        .step-box { background: #1f1f1f; border-left: 4px solid #4285F4; padding: 14px 18px; border-radius: 6px; margin: 12px 0; }
         .item { display: flex; align-items: center; gap: 15px; margin: 10px 0; padding: 12px; background: #1f1f1f; border-radius: 8px; border: 1px solid #333; }
         .item img { width: 52px; height: 52px; border-radius: 6px; object-fit: cover; background: #333; }
         .info { flex-grow: 1; }
@@ -247,19 +332,58 @@ def index():
     <h1>PSYTMusic Cloud Server <span class="badge">ONLINE</span></h1>
     <p>High-performance audio streaming & search server with native FFmpeg transcoding for Sony PSP.</p>
 
-    <div class="card" style="border-left: 4px solid #0070d1;">
-        <h3>YouTube Authentication (Bypass Bot Check on Render)</h3>
-        <p style="color: #bbb; font-size: 14px; margin-bottom: 12px;">
-            Render's cloud IP requires YouTube cookies to bypass <code>Sign in to confirm you're not a bot</code>.
+    <!-- YouTube Device OAuth Authentication Card -->
+    <div class="card" style="border-left: 4px solid #4285F4;">
+        <h3 style="margin-top:0; display:flex; align-items:center; gap:8px;">
+            <span>YouTube Authentication</span>
+            <span style="font-size:12px; background:#333; color:#aaa; padding:2px 8px; border-radius:10px;">Bypasses Datacenter Bot-Checks</span>
+        </h3>
+        <p style="color: #bbb; font-size: 14px; margin-bottom: 14px;">
+            Render's AWS datacenter IP requires YouTube authentication to stream music. Sign in once with Google to authorize this server.
         </p>
-        <div id="cookieStatus" style="font-weight: bold; margin-bottom: 12px; font-size: 15px;">Checking cookie status...</div>
-        <textarea id="cookieInput" style="width: 100%; height: 90px; background: #222; color: #fff; border: 1px solid #444; border-radius: 6px; padding: 10px; font-family: monospace; font-size: 12px; box-sizing: border-box;" placeholder="Paste exported Netscape cookies.txt here..."></textarea>
-        <div style="margin-top: 10px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
-            <button onclick="saveCookies()">Save YouTube Cookies</button>
-            <span style="font-size: 13px; color: #888;">Tip: Use browser extension <strong>Get cookies.txt LOCALLY</strong> on youtube.com, click Export, and paste here.</span>
+
+        <div id="authStatusBox" style="margin-bottom: 16px; font-size: 15px; font-weight: bold;">
+            Checking authentication status...
+        </div>
+
+        <div id="authActions">
+            <button id="signInBtn" class="btn-google" onclick="startOAuth()">
+                <svg width="18" height="18" viewBox="0 0 24 24"><path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg>
+                Sign In with YouTube / Google
+            </button>
+        </div>
+
+        <div id="deviceCodeFlow" style="display:none; margin-top:16px;">
+            <div class="step-box">
+                <div style="font-size: 15px; margin-bottom: 8px;"><strong>Follow these steps to link your server:</strong></div>
+                <div style="margin: 8px 0;">1. Open: <a id="deviceLink" href="https://www.google.com/device" target="_blank" style="color:#64b5f6; font-weight:bold; font-size:16px;">https://www.google.com/device &nearr;</a></div>
+                <div>2. Enter this code:</div>
+                <div><span id="userCodeDisplay" class="code-box">XXXX-YYYY</span> <button onclick="copyCode()" style="padding:6px 14px; font-size:13px; margin-left:10px;">Copy Code</button></div>
+                <div style="margin-top: 8px;">3. Click <strong>Allow</strong> on your Google account.</div>
+                <div id="pollStatus" style="margin-top:14px; color:#ffb74d; font-size:14px; display:flex; align-items:center; gap:8px;">
+                    <span style="display:inline-block; animation:spin 1s linear infinite;">&#9696;</span>
+                    Waiting for approval on Google (polling every 5 seconds)...
+                </div>
+            </div>
+        </div>
+
+        <div id="authBackupBox" style="display:none; margin-top: 15px;">
+            <details style="background:#0d0d0d; border:1px solid #333; border-radius:6px; padding:10px;">
+                <summary style="cursor:pointer; color:#aaa; font-size:13px; font-weight:bold;">
+                    &#128190; Save token to Render Environment Variables (Optional - keeps login permanent across redeploys)
+                </summary>
+                <div style="margin-top:10px; font-size:12px; color:#bbb;">
+                    In your Render Dashboard &rarr; <strong>Environment</strong> &rarr; Add:
+                    <div style="margin:6px 0;">Key: <code>YOUTUBE_OAUTH</code></div>
+                    <div>Value:</div>
+                    <textarea id="tokenJsonDisplay" readonly style="width:100%; height:70px; background:#1a1a1a; color:#a5d6a7; border:1px solid #444; border-radius:4px; font-family:monospace; font-size:11px; padding:6px; box-sizing:border-box;"></textarea>
+                    <button onclick="copyTokenJson()" style="padding:6px 12px; font-size:12px; margin-top:6px;">Copy Token JSON</button>
+                </div>
+            </details>
         </div>
     </div>
 
+    <!-- Live Search & Transcode Test Card -->
     <div class="card">
         <h3>Live Search & Transcode Test:</h3>
         <div style="display: flex; gap: 10px; margin-bottom: 20px;">
@@ -275,7 +399,121 @@ def index():
         <audio id="audioPlayer" controls style="display:none;"></audio>
     </div>
 
+    <style>
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+
     <script>
+        let pollTimer = null;
+        let currentDeviceCode = null;
+
+        async function checkAuthStatus() {
+            try {
+                const resp = await fetch('/api/oauth/status');
+                const data = await resp.json();
+                const box = document.getElementById('authStatusBox');
+                const actions = document.getElementById('authActions');
+                const backupBox = document.getElementById('authBackupBox');
+
+                if (data.authenticated) {
+                    box.innerHTML = '<span style="color: #4af626;">&#10004; ' + data.message + '</span>';
+                    actions.innerHTML = `
+                        <button class="btn-danger" onclick="logoutOAuth()">Sign Out</button>
+                        <button onclick="startOAuth()" style="margin-left: 10px; background:#333;">Re-authenticate</button>
+                    `;
+                    document.getElementById('deviceCodeFlow').style.display = 'none';
+                    if (data.token_json) {
+                        backupBox.style.display = 'block';
+                        document.getElementById('tokenJsonDisplay').value = data.token_json;
+                    }
+                } else {
+                    box.innerHTML = '<span style="color: #ff5252;">&#9888; ' + data.message + '</span>';
+                    actions.innerHTML = `
+                        <button class="btn-google" onclick="startOAuth()">
+                            <svg width="18" height="18" viewBox="0 0 24 24"><path fill="#fff" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/><path fill="#fff" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/><path fill="#fff" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l2.85-2.22.81-.63z"/><path fill="#fff" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.84c.87-2.6 3.3-4.52 6.16-4.52z"/></svg>
+                            Sign In with YouTube / Google
+                        </button>
+                    `;
+                    backupBox.style.display = 'none';
+                }
+            } catch (e) {
+                document.getElementById('authStatusBox').textContent = "Status check error: " + e;
+            }
+        }
+
+        async function startOAuth() {
+            if (pollTimer) clearInterval(pollTimer);
+            const btn = document.getElementById('signInBtn');
+            if (btn) btn.disabled = true;
+
+            try {
+                const resp = await fetch('/api/oauth/start', { method: 'POST' });
+                const data = await resp.json();
+                if (data.status !== 'ok') {
+                    alert('Error starting OAuth: ' + (data.detail || JSON.stringify(data)));
+                    return;
+                }
+
+                currentDeviceCode = data.device_code;
+                document.getElementById('userCodeDisplay').textContent = data.user_code;
+                document.getElementById('deviceLink').href = data.verification_url;
+                document.getElementById('deviceCodeFlow').style.display = 'block';
+
+                const interval = (data.interval || 5) * 1000;
+                pollTimer = setInterval(pollOAuthToken, interval);
+            } catch (e) {
+                alert('Connection error: ' + e);
+            } finally {
+                if (btn) btn.disabled = false;
+            }
+        }
+
+        async function pollOAuthToken() {
+            if (!currentDeviceCode) return;
+            try {
+                const resp = await fetch('/api/oauth/poll', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ device_code: currentDeviceCode })
+                });
+                const data = await resp.json();
+
+                if (data.status === 'success') {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    currentDeviceCode = null;
+                    alert('🎉 ' + data.message);
+                    checkAuthStatus();
+                } else if (data.status === 'expired') {
+                    clearInterval(pollTimer);
+                    pollTimer = null;
+                    document.getElementById('pollStatus').textContent = 'Code expired. Click Sign In to generate a new code.';
+                }
+            } catch (e) {
+                console.error("Poll error:", e);
+            }
+        }
+
+        async function logoutOAuth() {
+            if (!confirm('Are you sure you want to sign out?')) return;
+            try {
+                await fetch('/api/oauth/logout', { method: 'POST' });
+                checkAuthStatus();
+            } catch (e) {
+                alert('Logout error: ' + e);
+            }
+        }
+
+        function copyCode() {
+            const code = document.getElementById('userCodeDisplay').textContent;
+            navigator.clipboard.writeText(code).then(() => alert('Code copied to clipboard: ' + code));
+        }
+
+        function copyTokenJson() {
+            const json = document.getElementById('tokenJsonDisplay').value;
+            navigator.clipboard.writeText(json).then(() => alert('Token JSON copied to clipboard! Paste it into Render Environment Variables as YOUTUBE_OAUTH'));
+        }
+
         async function doSearch() {
             const q = document.getElementById('query').value.trim();
             if (!q) return;
@@ -320,49 +558,122 @@ def index():
             player.play();
         }
 
-        async function checkCookieStatus() {
-            try {
-                const resp = await fetch('/cookies_status');
-                const data = await resp.json();
-                const el = document.getElementById('cookieStatus');
-                if (data.authenticated) {
-                    el.innerHTML = '<span style="color: #4af626;">&#10004; ' + data.message + '</span>';
-                } else {
-                    el.innerHTML = '<span style="color: #ff5252;">&#9888; ' + data.message + '</span>';
-                }
-            } catch (e) {
-                document.getElementById('cookieStatus').textContent = "Status: offline";
-            }
-        }
-
-        async function saveCookies() {
-            const text = document.getElementById('cookieInput').value.trim();
-            if (!text) {
-                alert('Please paste exported YouTube cookies first.');
-                return;
-            }
-            try {
-                const resp = await fetch('/save_cookies', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'text/plain' },
-                    body: text
-                });
-                const res = await resp.json();
-                alert(res.message || 'Cookies saved successfully!');
-                document.getElementById('cookieInput').value = '';
-                checkCookieStatus();
-            } catch (e) {
-                alert('Error saving cookies: ' + e);
-            }
-        }
-
         window.onload = () => {
-            checkCookieStatus();
+            checkAuthStatus();
             doSearch();
         };
     </script>
 </body>
 </html>"""
+
+@app.get("/api/oauth/status")
+def api_oauth_status():
+    if has_oauth():
+        token = load_oauth_token()
+        return {
+            "authenticated": True,
+            "method": "oauth",
+            "message": "YouTube Account Connected (OAuth2 Active). Datacenter bot-check bypassed!",
+            "token_json": json.dumps(token)
+        }
+    if has_cookies():
+        size = os.path.getsize(COOKIE_FILE)
+        return {
+            "authenticated": True,
+            "method": "cookies",
+            "message": f"YouTube cookies active ({size} bytes).",
+            "token_json": ""
+        }
+    return {
+        "authenticated": False,
+        "method": "none",
+        "message": "Not authenticated. Sign in with Google to bypass datacenter bot detection.",
+        "token_json": ""
+    }
+
+@app.post("/api/oauth/start")
+def api_oauth_start():
+    try:
+        resp = requests.post(
+            "https://www.youtube.com/o/oauth2/device/code",
+            data=json.dumps({
+                "client_id": OAUTH_CLIENT_ID,
+                "scope": OAUTH_SCOPES,
+                "device_id": uuid.uuid4().hex,
+                "device_model": "ytlr::"
+            }),
+            headers={"Content-Type": "application/json", "__youtube_oauth__": "true"},
+            timeout=10
+        )
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Google OAuth rejected request: {resp.text}")
+        data = resp.json()
+        return {
+            "status": "ok",
+            "device_code": data["device_code"],
+            "user_code": data["user_code"],
+            "verification_url": data.get("verification_url", "https://www.google.com/device"),
+            "expires_in": data.get("expires_in", 1800),
+            "interval": data.get("interval", 5)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/oauth/poll")
+async def api_oauth_poll(request: Request):
+    try:
+        body = await request.json()
+        device_code = body.get("device_code")
+        if not device_code:
+            raise HTTPException(status_code=400, detail="Missing device_code")
+
+        resp = requests.post(
+            "https://www.youtube.com/o/oauth2/token",
+            data=json.dumps({
+                "client_id": OAUTH_CLIENT_ID,
+                "client_secret": OAUTH_CLIENT_SECRET,
+                "device_code": device_code,
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code"
+            }),
+            headers={"Content-Type": "application/json", "__youtube_oauth__": "true"},
+            timeout=10
+        )
+        data = resp.json()
+        if "access_token" in data:
+            token_data = {
+                "access_token": data["access_token"],
+                "expires": time.time() + data.get("expires_in", 3600),
+                "refresh_token": data.get("refresh_token", ""),
+                "token_type": data.get("token_type", "Bearer")
+            }
+            save_oauth_token(token_data)
+            return {
+                "status": "success",
+                "message": "YouTube account successfully linked! Bot-check bypassed.",
+                "token_json": json.dumps(token_data)
+            }
+
+        error = data.get("error", "")
+        if error == "authorization_pending":
+            return {"status": "pending"}
+        elif error == "expired_token":
+            return {"status": "expired", "message": "Code expired. Please generate a new code."}
+        else:
+            return {"status": "error", "message": data.get("error_description", error)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/oauth/logout")
+def api_oauth_logout():
+    try:
+        if os.path.exists(TOKEN_FILE):
+            os.remove(TOKEN_FILE)
+        cache_file = os.path.expanduser("~/.cache/yt-dlp/youtube-oauth2/token_data.json")
+        if os.path.exists(cache_file):
+            os.remove(cache_file)
+        return {"status": "ok", "message": "Logged out successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/cookies_status")
 def api_cookies_status():
@@ -522,14 +833,22 @@ def stream_mp3_ytdlp_pipe(video_id: str):
     which bypass datacenter bot-checks entirely.
     FFmpeg reads pipe:0, eliminating external CDN IP-locks.
     """
-    client_configs = [
-        ["--extractor-args", "youtube:player_client=visionos"],
-        ["--extractor-args", "youtube:player_client=android_creator"],
-        ["--extractor-args", "youtube:player_client=ios_creator"],
-        ["--extractor-args", "youtube:player_client=tv_embedded"],
-        ["--extractor-args", "youtube:player_client=android"],
-        []
-    ]
+    if has_oauth():
+        client_configs = [
+            [],
+            ["--extractor-args", "youtube:player_client=tv_embedded"],
+            ["--extractor-args", "youtube:player_client=android_creator"],
+            ["--extractor-args", "youtube:player_client=visionos"]
+        ]
+    else:
+        client_configs = [
+            ["--extractor-args", "youtube:player_client=visionos"],
+            ["--extractor-args", "youtube:player_client=android_creator"],
+            ["--extractor-args", "youtube:player_client=ios_creator"],
+            ["--extractor-args", "youtube:player_client=tv_embedded"],
+            ["--extractor-args", "youtube:player_client=android"],
+            []
+        ]
 
     cookie_args = get_cookie_args()
 
@@ -626,14 +945,22 @@ def stream_pcm_ytdlp_pipe(video_id: str):
     Direct pipe from yt-dlp to FFmpeg raw PCM (16-bit signed LE 44.1kHz stereo) for PSP bridge mode.
     Uses unblocked embedded, creator, and vision clients.
     """
-    client_configs = [
-        ["--extractor-args", "youtube:player_client=visionos"],
-        ["--extractor-args", "youtube:player_client=android_creator"],
-        ["--extractor-args", "youtube:player_client=ios_creator"],
-        ["--extractor-args", "youtube:player_client=tv_embedded"],
-        ["--extractor-args", "youtube:player_client=android"],
-        []
-    ]
+    if has_oauth():
+        client_configs = [
+            [],
+            ["--extractor-args", "youtube:player_client=tv_embedded"],
+            ["--extractor-args", "youtube:player_client=android_creator"],
+            ["--extractor-args", "youtube:player_client=visionos"]
+        ]
+    else:
+        client_configs = [
+            ["--extractor-args", "youtube:player_client=visionos"],
+            ["--extractor-args", "youtube:player_client=android_creator"],
+            ["--extractor-args", "youtube:player_client=ios_creator"],
+            ["--extractor-args", "youtube:player_client=tv_embedded"],
+            ["--extractor-args", "youtube:player_client=android"],
+            []
+        ]
 
     cookie_args = get_cookie_args()
 

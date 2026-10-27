@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -U yt-dlp
 
 COPY server.py .
 COPY cookies.txt* ./
+COPY token.json* ./
 
 ENV PORT=10000
 EXPOSE 10000
