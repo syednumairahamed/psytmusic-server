@@ -52,117 +52,39 @@ def extract_audio_url(video_id: str) -> str:
     if cached:
         return cached
 
-    # Strategy 1: YouTube Music WEB_REMIX InnerTube API (Never blocked on Render datacenter IPs)
-    try:
-        payload = {
-            "context": {
-                "client": {
-                    "clientName": "WEB_REMIX",
-                    "clientVersion": "1.20240401.01.00",
-                    "hl": "en",
-                    "gl": "US"
-                }
-            },
-            "videoId": video_id
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-            "Referer": "https://music.youtube.com/",
-            "Origin": "https://music.youtube.com"
-        }
-        resp = requests.post("https://music.youtube.com/youtubei/v1/player", json=payload, headers=headers, timeout=4.0)
-        if resp.status_code == 200:
-            data = resp.json()
-            streaming_data = data.get("streamingData", {})
-            formats = streaming_data.get("formats", []) + streaming_data.get("adaptiveFormats", [])
-            with_url = [f for f in formats if f.get("url")]
-            if with_url:
-                audio_url = with_url[0]["url"]
-                for f in with_url:
-                    if "audio" in f.get("mimeType", ""):
-                        audio_url = f["url"]
-                        break
-                set_cached_url(video_id, audio_url)
-                return audio_url
-    except Exception as e:
-        print(f"WEB_REMIX extract error: {e}")
-
-    # Strategy 2: Invidious Proxy Stream (Mirrored on instance server, eliminates 403 Google IP-lock)
-    invidious_mirrors = [
-        "https://inv.nadeko.net",
-        "https://invidious.nerdvpn.de",
-        "https://yewtu.be",
-        "https://invidious.jing.rocks"
-    ]
-    for mirror in invidious_mirrors:
+    # yt-dlp Smart TV / Mobile Web Extraction directly from Render IP
+    for client_list in [['tv_embedded', 'mweb', 'web_creator', 'ios'], ['android', 'ios']]:
         try:
-            proxy_url = f"{mirror}/latest_version?id={video_id}&itag=140"
-            resp = requests.head(proxy_url, timeout=2.5, allow_redirects=False)
-            if resp.status_code in [200, 302, 307]:
-                target = resp.headers.get("Location", proxy_url)
-                set_cached_url(video_id, target)
-                return target
-        except Exception:
-            continue
-
-    # Strategy 3: Piped API Network (with proxyUrl preference)
-    piped_mirrors = [
-        "https://pipedapi.kavin.rocks",
-        "https://api.piped.privacy.com.de",
-        "https://pipedapi.tokhmi.xyz",
-        "https://piped-api.lunar.icu"
-    ]
-    for mirror in piped_mirrors:
-        try:
-            resp = requests.get(f"{mirror}/streams/{video_id}", timeout=2.5)
-            if resp.status_code == 200:
-                data = resp.json()
-                audio_streams = data.get("audioStreams", [])
-                if audio_streams:
-                    audio_url = audio_streams[0].get("proxyUrl") or audio_streams[0].get("url")
-                    for s in audio_streams:
-                        if s.get("format") in ["m4a", "M4A"]:
-                            audio_url = s.get("proxyUrl") or s.get("url")
-                            break
-                    if audio_url:
-                        set_cached_url(video_id, audio_url)
-                        return audio_url
-        except Exception:
-            continue
-
-    # Strategy 4: yt-dlp Smart TV / Mobile Web Extraction
-    try:
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio/best',
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-            'extract_flat': False,
-            'nocheckcertificate': True,
-            'socket_timeout': 6,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['tv_embedded', 'mweb', 'web_creator', 'ios']
+            ydl_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio/best',
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+                'extract_flat': False,
+                'nocheckcertificate': True,
+                'socket_timeout': 6,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': client_list
+                    }
                 }
             }
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
-            audio_url = info.get('url')
-            if not audio_url:
-                formats = info.get('formats', [])
-                for f in reversed(formats):
-                    if f.get('vcodec') == 'none' and f.get('url'):
-                        audio_url = f.get('url')
-                        break
-            if audio_url:
-                set_cached_url(video_id, audio_url)
-                return audio_url
-    except Exception as e:
-        print(f"yt-dlp extract error: {e}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+                audio_url = info.get('url')
+                if not audio_url:
+                    formats = info.get('formats', [])
+                    for f in reversed(formats):
+                        if f.get('vcodec') == 'none' and f.get('url'):
+                            audio_url = f.get('url')
+                            break
+                if audio_url:
+                    set_cached_url(video_id, audio_url)
+                    return audio_url
+        except Exception as e:
+            print(f"yt-dlp extract error ({client_list}): {e}")
 
-    raise HTTPException(status_code=502, detail=f"Could not resolve audio stream for {video_id}")
+    return None
 
 def search_songs(query: str):
     """Searches YouTube Music, with yt-dlp fallback."""
@@ -348,12 +270,12 @@ def api_search_txt(q: str):
 
 def build_mp3_stream(audio_url: str):
     """
-    Transcodes any YouTube audio stream on-the-fly to strict CBR 128kbps 44.1kHz stereo MP3.
-    This guarantees 100% compatibility with Sony PSP hardware Media Engine / sceMp3 decoder.
+    Transcodes resolved YouTube audio URL to strict CBR 128kbps 44.1kHz stereo MP3 for PSP.
+    Pre-checks initial bytes to ensure FFmpeg successfully connected.
     """
     ffmpeg_cmd = [
         "ffmpeg",
-        "-loglevel", "quiet",
+        "-loglevel", "error",
         "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\nReferer: https://music.youtube.com/\r\n",
         "-reconnect", "1",
         "-reconnect_streamed", "1",
@@ -371,11 +293,25 @@ def build_mp3_stream(audio_url: str):
     proc = subprocess.Popen(
         ffmpeg_cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         bufsize=65536
     )
 
+    try:
+        first_chunk = proc.stdout.read(8192)
+    except Exception as e:
+        print(f"Error reading first chunk from FFmpeg URL stream: {e}")
+        first_chunk = b""
+
+    if not first_chunk:
+        err = proc.stderr.read().decode(errors="ignore")
+        print(f"FFmpeg URL stream failed (0 bytes): {err.strip()}")
+        if proc.poll() is None:
+            proc.terminate()
+        return None
+
     def iterfile():
+        yield first_chunk
         try:
             while True:
                 data = proc.stdout.read(8192)
@@ -401,15 +337,17 @@ def build_mp3_stream(audio_url: str):
         }
     )
 
-def build_mp3_stream_from_ytdlp(video_id: str):
+def stream_mp3_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg.
-    yt-dlp authenticates using Smart TV/Mobile Web tokens and streams chunks into FFmpeg's stdin.
+    yt-dlp authenticates using Smart TV / mobile tokens directly from Render container.
+    FFmpeg reads pipe:0, eliminating external CDN IP-locks.
     """
     ytdlp_cmd = [
         sys.executable, "-m", "yt_dlp",
         "--quiet",
         "--no-warnings",
+        "--no-playlist",
         "--extractor-args", "youtube:player_client=tv_embedded,mweb,web_creator,ios",
         "-f", "bestaudio[ext=m4a]/bestaudio/best",
         "-o", "-",
@@ -418,12 +356,12 @@ def build_mp3_stream_from_ytdlp(video_id: str):
     proc_ytdlp = subprocess.Popen(
         ytdlp_cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.PIPE
     )
 
     ffmpeg_cmd = [
         "ffmpeg",
-        "-loglevel", "quiet",
+        "-loglevel", "error",
         "-i", "pipe:0",
         "-vn",
         "-c:a", "libmp3lame",
@@ -437,11 +375,31 @@ def build_mp3_stream_from_ytdlp(video_id: str):
         ffmpeg_cmd,
         stdin=proc_ytdlp.stdout,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         bufsize=65536
     )
+    # Close parent copy of pipe so EOF reaches FFmpeg when yt-dlp finishes
+    if proc_ytdlp.stdout:
+        proc_ytdlp.stdout.close()
+
+    try:
+        first_chunk = proc_ffmpeg.stdout.read(8192)
+    except Exception as e:
+        print(f"Error reading first chunk from yt-dlp pipe: {e}")
+        first_chunk = b""
+
+    if not first_chunk:
+        err_ff = proc_ffmpeg.stderr.read().decode(errors="ignore") if proc_ffmpeg.stderr else ""
+        err_yt = proc_ytdlp.stderr.read().decode(errors="ignore") if proc_ytdlp.stderr else ""
+        print(f"yt-dlp pipe produced 0 bytes for {video_id}. FFmpeg: {err_ff.strip()} | yt-dlp: {err_yt.strip()}")
+        if proc_ffmpeg.poll() is None:
+            proc_ffmpeg.terminate()
+        if proc_ytdlp.poll() is None:
+            proc_ytdlp.terminate()
+        return None
 
     def iterpipe():
+        yield first_chunk
         try:
             while True:
                 data = proc_ffmpeg.stdout.read(8192)
@@ -451,8 +409,16 @@ def build_mp3_stream_from_ytdlp(video_id: str):
         finally:
             if proc_ffmpeg.poll() is None:
                 proc_ffmpeg.terminate()
+                try:
+                    proc_ffmpeg.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc_ffmpeg.kill()
             if proc_ytdlp.poll() is None:
                 proc_ytdlp.terminate()
+                try:
+                    proc_ytdlp.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc_ytdlp.kill()
 
     return StreamingResponse(
         iterpipe(),
@@ -465,14 +431,15 @@ def build_mp3_stream_from_ytdlp(video_id: str):
         }
     )
 
-def build_pcm_stream_from_ytdlp(video_id: str):
+def stream_pcm_ytdlp_pipe(video_id: str):
     """
-    Direct pipe from yt-dlp to FFmpeg raw PCM (16-bit signed LE 44.1kHz stereo).
+    Direct pipe from yt-dlp to FFmpeg raw PCM (16-bit signed LE 44.1kHz stereo) for PSP bridge mode.
     """
     ytdlp_cmd = [
         sys.executable, "-m", "yt_dlp",
         "--quiet",
         "--no-warnings",
+        "--no-playlist",
         "--extractor-args", "youtube:player_client=tv_embedded,mweb,web_creator,ios",
         "-f", "bestaudio[ext=m4a]/bestaudio/best",
         "-o", "-",
@@ -481,12 +448,12 @@ def build_pcm_stream_from_ytdlp(video_id: str):
     proc_ytdlp = subprocess.Popen(
         ytdlp_cmd,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL
+        stderr=subprocess.PIPE
     )
 
     ffmpeg_cmd = [
         "ffmpeg",
-        "-loglevel", "quiet",
+        "-loglevel", "error",
         "-i", "pipe:0",
         "-vn",
         "-c:a", "pcm_s16le",
@@ -499,11 +466,26 @@ def build_pcm_stream_from_ytdlp(video_id: str):
         ffmpeg_cmd,
         stdin=proc_ytdlp.stdout,
         stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
         bufsize=65536
     )
+    if proc_ytdlp.stdout:
+        proc_ytdlp.stdout.close()
+
+    try:
+        first_chunk = proc_ffmpeg.stdout.read(8192)
+    except Exception as e:
+        first_chunk = b""
+
+    if not first_chunk:
+        if proc_ffmpeg.poll() is None:
+            proc_ffmpeg.terminate()
+        if proc_ytdlp.poll() is None:
+            proc_ytdlp.terminate()
+        return None
 
     def iterpcm():
+        yield first_chunk
         try:
             while True:
                 data = proc_ffmpeg.stdout.read(8192)
@@ -525,65 +507,50 @@ def build_pcm_stream_from_ytdlp(video_id: str):
 @app.get("/stream/{video_id}.mp3")
 def stream_mp3_by_path(video_id: str):
     vid = video_id.replace(".mp3", "")
+    print(f"--- Audio stream requested for {vid} ---")
+
+    # Strategy 1: Direct yt-dlp -> FFmpeg process pipe (Zero IP-lock, cloud container native)
+    resp = stream_mp3_ytdlp_pipe(vid)
+    if resp:
+        print(f"Streaming {vid} via yt-dlp pipe (SUCCESS)")
+        return resp
+
+    # Strategy 2: Extract direct audio URL via yt-dlp on Render and feed to FFmpeg
     try:
         audio_url = extract_audio_url(vid)
         if audio_url:
-            return build_mp3_stream(audio_url)
+            resp = build_mp3_stream(audio_url)
+            if resp:
+                print(f"Streaming {vid} via resolved URL (SUCCESS)")
+                return resp
     except Exception as e:
-        print(f"URL extraction failed ({e}), falling back to direct yt-dlp pipeline")
-    return build_mp3_stream_from_ytdlp(vid)
+        print(f"Strategy 2 URL transcode error for {vid}: {e}")
+
+    # If all strategies fail, return 502 Bad Gateway so PSP immediately triggers PC Bridge fallback
+    print(f"CRITICAL: Failed to stream {vid} across all strategies -> Returning HTTP 502")
+    raise HTTPException(status_code=502, detail=f"Audio stream unavailable for {vid}")
 
 @app.get("/stream/{video_id}.pcm")
 def stream_pcm_by_path(video_id: str):
     vid = video_id.replace(".pcm", "")
-    return stream_by_query(id=vid, format="pcm")
+    resp = stream_pcm_ytdlp_pipe(vid)
+    if resp:
+        return resp
+    raise HTTPException(status_code=502, detail=f"PCM stream unavailable for {vid}")
 
 @app.get("/stream")
 def stream_by_query(id: str = None, video_id: str = None, format: str = "mp3"):
     vid = id or video_id
     if not vid:
         raise HTTPException(status_code=400, detail="Missing id parameter")
-    # Clean id if passed with extension
     vid = vid.replace(".mp3", "").replace(".pcm", "").replace(".m4a", "")
 
     if format == "pcm":
-        try:
-            audio_url = extract_audio_url(vid)
-            if audio_url:
-                ffmpeg_cmd = [
-                    "ffmpeg",
-                    "-loglevel", "quiet",
-                    "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nReferer: https://music.youtube.com/\r\n",
-                    "-reconnect", "1",
-                    "-reconnect_streamed", "1",
-                    "-reconnect_delay_max", "5",
-                    "-i", audio_url,
-                    "-vn",
-                    "-c:a", "pcm_s16le",
-                    "-ar", "44100",
-                    "-ac", "2",
-                    "-f", "s16le",
-                    "pipe:1"
-                ]
-                proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=65536)
-                def iterpcm():
-                    try:
-                        while True:
-                            data = proc.stdout.read(8192)
-                            if not data:
-                                break
-                            yield data
-                    finally:
-                        if proc.poll() is None:
-                            proc.terminate()
-                return StreamingResponse(iterpcm(), media_type="application/octet-stream", headers={"Access-Control-Allow-Origin": "*"})
-        except Exception as e:
-            print(f"PCM direct URL error: {e}, falling back to yt-dlp pipeline")
-        return build_pcm_stream_from_ytdlp(vid)
+        return stream_pcm_by_path(vid)
 
     return stream_mp3_by_path(vid)
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8080))
+    port = int(os.environ.get("PORT", 10000))
     uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
