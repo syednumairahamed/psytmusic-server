@@ -51,7 +51,95 @@ def extract_audio_url(video_id: str) -> str:
     if cached:
         return cached
 
-    # Strategy 1: YouTube InnerTube Android client (lightning fast 0.3s, no datacenter bot-blocking)
+    # Strategy 1: Piped API Network (High-speed cloud mirrors, no datacenter blocks)
+    piped_mirrors = [
+        "https://pipedapi.kavin.rocks",
+        "https://api.piped.privacy.com.de",
+        "https://pipedapi.tokhmi.xyz",
+        "https://piped-api.lunar.icu"
+    ]
+    for mirror in piped_mirrors:
+        try:
+            resp = requests.get(f"{mirror}/streams/{video_id}", timeout=2.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                audio_streams = data.get("audioStreams", [])
+                if audio_streams:
+                    # Prefer highest bitrate m4a / webm audio
+                    audio_url = audio_streams[0].get("url")
+                    for s in audio_streams:
+                        if s.get("format") in ["m4a", "M4A"] and s.get("url"):
+                            audio_url = s["url"]
+                            break
+                    if audio_url:
+                        set_cached_url(video_id, audio_url)
+                        return audio_url
+        except Exception:
+            continue
+
+    # Strategy 2: Invidious v1 JSON API
+    invidious_mirrors = [
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://yewtu.be",
+        "https://invidious.jing.rocks"
+    ]
+    for mirror in invidious_mirrors:
+        try:
+            resp = requests.get(f"{mirror}/api/v1/videos/{video_id}", timeout=2.5)
+            if resp.status_code == 200:
+                data = resp.json()
+                formats = data.get("adaptiveFormats", []) + data.get("formatStreams", [])
+                for f in formats:
+                    mime = f.get("type", "") or f.get("mimeType", "")
+                    if "audio" in mime and f.get("url"):
+                        audio_url = f["url"]
+                        set_cached_url(video_id, audio_url)
+                        return audio_url
+        except Exception:
+            continue
+
+    # Strategy 3: YouTube InnerTube iOS client (Bypasses Android datacenter flag)
+    try:
+        payload = {
+            "context": {
+                "client": {
+                    "clientName": "IOS",
+                    "clientVersion": "19.29.1",
+                    "deviceModel": "iPhone14,3",
+                    "userAgent": "com.google.ios.youtube/19.29.1 (iPhone14,3; U; CPU iOS 17_5_1 like Mac OS X)",
+                    "osName": "iOS",
+                    "osVersion": "17.5.1.21F90",
+                    "hl": "en",
+                    "gl": "US"
+                }
+            },
+            "videoId": video_id
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone14,3; U; CPU iOS 17_5_1 like Mac OS X)",
+            "X-YouTube-Client-Name": "5",
+            "X-YouTube-Client-Version": "19.29.1"
+        }
+        resp = requests.post("https://www.youtube.com/youtubei/v1/player", json=payload, headers=headers, timeout=2.5)
+        if resp.status_code == 200:
+            data = resp.json()
+            streaming_data = data.get("streamingData", {})
+            formats = streaming_data.get("formats", []) + streaming_data.get("adaptiveFormats", [])
+            with_url = [f for f in formats if f.get("url")]
+            if with_url:
+                audio_url = with_url[0]["url"]
+                for f in with_url:
+                    if "audio" in f.get("mimeType", ""):
+                        audio_url = f["url"]
+                        break
+                set_cached_url(video_id, audio_url)
+                return audio_url
+    except Exception as e:
+        print(f"InnerTube iOS extract error: {e}")
+
+    # Strategy 4: YouTube InnerTube Android client
     try:
         payload = {
             "context": {
@@ -72,14 +160,13 @@ def extract_audio_url(video_id: str) -> str:
             "Content-Type": "application/json",
             "User-Agent": "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip"
         }
-        resp = requests.post("https://www.youtube.com/youtubei/v1/player", json=payload, headers=headers, timeout=5)
+        resp = requests.post("https://www.youtube.com/youtubei/v1/player", json=payload, headers=headers, timeout=2.5)
         if resp.status_code == 200:
             data = resp.json()
             streaming_data = data.get("streamingData", {})
             formats = streaming_data.get("formats", []) + streaming_data.get("adaptiveFormats", [])
             with_url = [f for f in formats if f.get("url")]
             if with_url:
-                # Prefer audio-only or progressive format
                 audio_url = with_url[0]["url"]
                 for f in with_url:
                     if "audio" in f.get("mimeType", ""):
@@ -90,25 +177,7 @@ def extract_audio_url(video_id: str) -> str:
     except Exception as e:
         print(f"InnerTube Android extract error: {e}")
 
-    # Strategy 2: Invidious stream mirrors fallback
-    invidious_mirrors = [
-        "https://inv.nadeko.net",
-        "https://invidious.nerdvpn.de",
-        "https://yewtu.be",
-        "https://invidious.jing.rocks"
-    ]
-    for mirror in invidious_mirrors:
-        try:
-            test_url = f"{mirror}/latest_version?id={video_id}&itag=18"
-            r = requests.head(test_url, timeout=3, allow_redirects=True)
-            if r.status_code in [200, 206, 302]:
-                resolved = r.url if r.url else test_url
-                set_cached_url(video_id, resolved)
-                return resolved
-        except Exception:
-            continue
-
-    # Strategy 3: yt-dlp fallback with mobile clients
+    # Strategy 5: yt-dlp fallback
     try:
         ydl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio/best',
@@ -117,9 +186,10 @@ def extract_audio_url(video_id: str) -> str:
             'skip_download': True,
             'extract_flat': False,
             'nocheckcertificate': True,
+            'socket_timeout': 3,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'ios', 'web']
+                    'player_client': ['ios', 'android', 'web']
                 }
             }
         }
@@ -138,7 +208,7 @@ def extract_audio_url(video_id: str) -> str:
     except Exception as e:
         print(f"yt-dlp extract error: {e}")
 
-    raise HTTPException(status_code=404, detail="Could not resolve direct audio stream")
+    raise HTTPException(status_code=502, detail=f"Could not resolve audio stream for {video_id}")
 
 def search_songs(query: str):
     """Searches YouTube Music, with yt-dlp fallback."""
@@ -380,6 +450,11 @@ def build_mp3_stream(audio_url: str):
 def stream_mp3_by_path(video_id: str):
     audio_url = extract_audio_url(video_id)
     return build_mp3_stream(audio_url)
+
+@app.get("/stream/{video_id}.pcm")
+def stream_pcm_by_path(video_id: str):
+    vid = video_id.replace(".pcm", "")
+    return stream_by_query(id=vid, format="pcm")
 
 @app.get("/stream")
 def stream_by_query(id: str = None, video_id: str = None, format: str = "mp3"):
