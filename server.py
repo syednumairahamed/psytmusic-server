@@ -1,5 +1,6 @@
 import io
 import os
+import sys
 import subprocess
 import urllib.parse
 from fastapi import FastAPI, HTTPException, Request, Response
@@ -51,7 +52,61 @@ def extract_audio_url(video_id: str) -> str:
     if cached:
         return cached
 
-    # Strategy 1: Piped API Network (High-speed cloud mirrors, no datacenter blocks)
+    # Strategy 1: YouTube Music WEB_REMIX InnerTube API (Never blocked on Render datacenter IPs)
+    try:
+        payload = {
+            "context": {
+                "client": {
+                    "clientName": "WEB_REMIX",
+                    "clientVersion": "1.20240401.01.00",
+                    "hl": "en",
+                    "gl": "US"
+                }
+            },
+            "videoId": video_id
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Referer": "https://music.youtube.com/",
+            "Origin": "https://music.youtube.com"
+        }
+        resp = requests.post("https://music.youtube.com/youtubei/v1/player", json=payload, headers=headers, timeout=4.0)
+        if resp.status_code == 200:
+            data = resp.json()
+            streaming_data = data.get("streamingData", {})
+            formats = streaming_data.get("formats", []) + streaming_data.get("adaptiveFormats", [])
+            with_url = [f for f in formats if f.get("url")]
+            if with_url:
+                audio_url = with_url[0]["url"]
+                for f in with_url:
+                    if "audio" in f.get("mimeType", ""):
+                        audio_url = f["url"]
+                        break
+                set_cached_url(video_id, audio_url)
+                return audio_url
+    except Exception as e:
+        print(f"WEB_REMIX extract error: {e}")
+
+    # Strategy 2: Invidious Proxy Stream (Mirrored on instance server, eliminates 403 Google IP-lock)
+    invidious_mirrors = [
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://yewtu.be",
+        "https://invidious.jing.rocks"
+    ]
+    for mirror in invidious_mirrors:
+        try:
+            proxy_url = f"{mirror}/latest_version?id={video_id}&itag=140"
+            resp = requests.head(proxy_url, timeout=2.5, allow_redirects=False)
+            if resp.status_code in [200, 302, 307]:
+                target = resp.headers.get("Location", proxy_url)
+                set_cached_url(video_id, target)
+                return target
+        except Exception:
+            continue
+
+    # Strategy 3: Piped API Network (with proxyUrl preference)
     piped_mirrors = [
         "https://pipedapi.kavin.rocks",
         "https://api.piped.privacy.com.de",
@@ -65,11 +120,10 @@ def extract_audio_url(video_id: str) -> str:
                 data = resp.json()
                 audio_streams = data.get("audioStreams", [])
                 if audio_streams:
-                    # Prefer highest bitrate m4a / webm audio
-                    audio_url = audio_streams[0].get("url")
+                    audio_url = audio_streams[0].get("proxyUrl") or audio_streams[0].get("url")
                     for s in audio_streams:
-                        if s.get("format") in ["m4a", "M4A"] and s.get("url"):
-                            audio_url = s["url"]
+                        if s.get("format") in ["m4a", "M4A"]:
+                            audio_url = s.get("proxyUrl") or s.get("url")
                             break
                     if audio_url:
                         set_cached_url(video_id, audio_url)
@@ -77,107 +131,7 @@ def extract_audio_url(video_id: str) -> str:
         except Exception:
             continue
 
-    # Strategy 2: Invidious v1 JSON API
-    invidious_mirrors = [
-        "https://inv.nadeko.net",
-        "https://invidious.nerdvpn.de",
-        "https://yewtu.be",
-        "https://invidious.jing.rocks"
-    ]
-    for mirror in invidious_mirrors:
-        try:
-            resp = requests.get(f"{mirror}/api/v1/videos/{video_id}", timeout=2.5)
-            if resp.status_code == 200:
-                data = resp.json()
-                formats = data.get("adaptiveFormats", []) + data.get("formatStreams", [])
-                for f in formats:
-                    mime = f.get("type", "") or f.get("mimeType", "")
-                    if "audio" in mime and f.get("url"):
-                        audio_url = f["url"]
-                        set_cached_url(video_id, audio_url)
-                        return audio_url
-        except Exception:
-            continue
-
-    # Strategy 3: YouTube InnerTube iOS client (Bypasses Android datacenter flag)
-    try:
-        payload = {
-            "context": {
-                "client": {
-                    "clientName": "IOS",
-                    "clientVersion": "19.29.1",
-                    "deviceModel": "iPhone14,3",
-                    "userAgent": "com.google.ios.youtube/19.29.1 (iPhone14,3; U; CPU iOS 17_5_1 like Mac OS X)",
-                    "osName": "iOS",
-                    "osVersion": "17.5.1.21F90",
-                    "hl": "en",
-                    "gl": "US"
-                }
-            },
-            "videoId": video_id
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone14,3; U; CPU iOS 17_5_1 like Mac OS X)",
-            "X-YouTube-Client-Name": "5",
-            "X-YouTube-Client-Version": "19.29.1"
-        }
-        resp = requests.post("https://www.youtube.com/youtubei/v1/player", json=payload, headers=headers, timeout=2.5)
-        if resp.status_code == 200:
-            data = resp.json()
-            streaming_data = data.get("streamingData", {})
-            formats = streaming_data.get("formats", []) + streaming_data.get("adaptiveFormats", [])
-            with_url = [f for f in formats if f.get("url")]
-            if with_url:
-                audio_url = with_url[0]["url"]
-                for f in with_url:
-                    if "audio" in f.get("mimeType", ""):
-                        audio_url = f["url"]
-                        break
-                set_cached_url(video_id, audio_url)
-                return audio_url
-    except Exception as e:
-        print(f"InnerTube iOS extract error: {e}")
-
-    # Strategy 4: YouTube InnerTube Android client
-    try:
-        payload = {
-            "context": {
-                "client": {
-                    "clientName": "ANDROID",
-                    "clientVersion": "21.26.364",
-                    "androidSdkVersion": 30,
-                    "userAgent": "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip",
-                    "osName": "Android",
-                    "osVersion": "11",
-                    "hl": "en",
-                    "gl": "US"
-                }
-            },
-            "videoId": video_id
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "com.google.android.youtube/21.26.364 (Linux; U; Android 11) gzip"
-        }
-        resp = requests.post("https://www.youtube.com/youtubei/v1/player", json=payload, headers=headers, timeout=2.5)
-        if resp.status_code == 200:
-            data = resp.json()
-            streaming_data = data.get("streamingData", {})
-            formats = streaming_data.get("formats", []) + streaming_data.get("adaptiveFormats", [])
-            with_url = [f for f in formats if f.get("url")]
-            if with_url:
-                audio_url = with_url[0]["url"]
-                for f in with_url:
-                    if "audio" in f.get("mimeType", ""):
-                        audio_url = f["url"]
-                        break
-                set_cached_url(video_id, audio_url)
-                return audio_url
-    except Exception as e:
-        print(f"InnerTube Android extract error: {e}")
-
-    # Strategy 5: yt-dlp fallback
+    # Strategy 4: yt-dlp Smart TV / Mobile Web Extraction
     try:
         ydl_opts = {
             'format': 'bestaudio[ext=m4a]/bestaudio/best',
@@ -186,10 +140,10 @@ def extract_audio_url(video_id: str) -> str:
             'skip_download': True,
             'extract_flat': False,
             'nocheckcertificate': True,
-            'socket_timeout': 3,
+            'socket_timeout': 6,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['ios', 'android', 'web']
+                    'player_client': ['tv_embedded', 'mweb', 'web_creator', 'ios']
                 }
             }
         }
@@ -400,6 +354,7 @@ def build_mp3_stream(audio_url: str):
     ffmpeg_cmd = [
         "ffmpeg",
         "-loglevel", "quiet",
+        "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\nReferer: https://music.youtube.com/\r\n",
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
@@ -446,10 +401,137 @@ def build_mp3_stream(audio_url: str):
         }
     )
 
+def build_mp3_stream_from_ytdlp(video_id: str):
+    """
+    Direct pipe from yt-dlp to FFmpeg.
+    yt-dlp authenticates using Smart TV/Mobile Web tokens and streams chunks into FFmpeg's stdin.
+    """
+    ytdlp_cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--quiet",
+        "--no-warnings",
+        "--extractor-args", "youtube:player_client=tv_embedded,mweb,web_creator,ios",
+        "-f", "bestaudio[ext=m4a]/bestaudio/best",
+        "-o", "-",
+        f"https://www.youtube.com/watch?v={video_id}"
+    ]
+    proc_ytdlp = subprocess.Popen(
+        ytdlp_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-loglevel", "quiet",
+        "-i", "pipe:0",
+        "-vn",
+        "-c:a", "libmp3lame",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-ac", "2",
+        "-f", "mp3",
+        "pipe:1"
+    ]
+    proc_ffmpeg = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=proc_ytdlp.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=65536
+    )
+
+    def iterpipe():
+        try:
+            while True:
+                data = proc_ffmpeg.stdout.read(8192)
+                if not data:
+                    break
+                yield data
+        finally:
+            if proc_ffmpeg.poll() is None:
+                proc_ffmpeg.terminate()
+            if proc_ytdlp.poll() is None:
+                proc_ytdlp.terminate()
+
+    return StreamingResponse(
+        iterpipe(),
+        media_type="audio/mpeg",
+        headers={
+            "Content-Type": "audio/mpeg",
+            "Accept-Ranges": "none",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=3600"
+        }
+    )
+
+def build_pcm_stream_from_ytdlp(video_id: str):
+    """
+    Direct pipe from yt-dlp to FFmpeg raw PCM (16-bit signed LE 44.1kHz stereo).
+    """
+    ytdlp_cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "--quiet",
+        "--no-warnings",
+        "--extractor-args", "youtube:player_client=tv_embedded,mweb,web_creator,ios",
+        "-f", "bestaudio[ext=m4a]/bestaudio/best",
+        "-o", "-",
+        f"https://www.youtube.com/watch?v={video_id}"
+    ]
+    proc_ytdlp = subprocess.Popen(
+        ytdlp_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL
+    )
+
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-loglevel", "quiet",
+        "-i", "pipe:0",
+        "-vn",
+        "-c:a", "pcm_s16le",
+        "-ar", "44100",
+        "-ac", "2",
+        "-f", "s16le",
+        "pipe:1"
+    ]
+    proc_ffmpeg = subprocess.Popen(
+        ffmpeg_cmd,
+        stdin=proc_ytdlp.stdout,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=65536
+    )
+
+    def iterpcm():
+        try:
+            while True:
+                data = proc_ffmpeg.stdout.read(8192)
+                if not data:
+                    break
+                yield data
+        finally:
+            if proc_ffmpeg.poll() is None:
+                proc_ffmpeg.terminate()
+            if proc_ytdlp.poll() is None:
+                proc_ytdlp.terminate()
+
+    return StreamingResponse(
+        iterpcm(),
+        media_type="application/octet-stream",
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
+
 @app.get("/stream/{video_id}.mp3")
 def stream_mp3_by_path(video_id: str):
-    audio_url = extract_audio_url(video_id)
-    return build_mp3_stream(audio_url)
+    vid = video_id.replace(".mp3", "")
+    try:
+        audio_url = extract_audio_url(vid)
+        if audio_url:
+            return build_mp3_stream(audio_url)
+    except Exception as e:
+        print(f"URL extraction failed ({e}), falling back to direct yt-dlp pipeline")
+    return build_mp3_stream_from_ytdlp(vid)
 
 @app.get("/stream/{video_id}.pcm")
 def stream_pcm_by_path(video_id: str):
@@ -463,38 +545,43 @@ def stream_by_query(id: str = None, video_id: str = None, format: str = "mp3"):
         raise HTTPException(status_code=400, detail="Missing id parameter")
     # Clean id if passed with extension
     vid = vid.replace(".mp3", "").replace(".pcm", "").replace(".m4a", "")
-    audio_url = extract_audio_url(vid)
 
     if format == "pcm":
-        # Raw signed 16-bit LE stereo 44.1kHz PCM for sceAudioOutputBlocking with 0% CPU decode
-        ffmpeg_cmd = [
-            "ffmpeg",
-            "-loglevel", "quiet",
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
-            "-reconnect_delay_max", "5",
-            "-i", audio_url,
-            "-vn",
-            "-c:a", "pcm_s16le",
-            "-ar", "44100",
-            "-ac", "2",
-            "-f", "s16le",
-            "pipe:1"
-        ]
-        proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=65536)
-        def iterpcm():
-            try:
-                while True:
-                    data = proc.stdout.read(8192)
-                    if not data:
-                        break
-                    yield data
-            finally:
-                if proc.poll() is None:
-                    proc.terminate()
-        return StreamingResponse(iterpcm(), media_type="application/octet-stream", headers={"Access-Control-Allow-Origin": "*"})
+        try:
+            audio_url = extract_audio_url(vid)
+            if audio_url:
+                ffmpeg_cmd = [
+                    "ffmpeg",
+                    "-loglevel", "quiet",
+                    "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\nReferer: https://music.youtube.com/\r\n",
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                    "-i", audio_url,
+                    "-vn",
+                    "-c:a", "pcm_s16le",
+                    "-ar", "44100",
+                    "-ac", "2",
+                    "-f", "s16le",
+                    "pipe:1"
+                ]
+                proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=65536)
+                def iterpcm():
+                    try:
+                        while True:
+                            data = proc.stdout.read(8192)
+                            if not data:
+                                break
+                            yield data
+                    finally:
+                        if proc.poll() is None:
+                            proc.terminate()
+                return StreamingResponse(iterpcm(), media_type="application/octet-stream", headers={"Access-Control-Allow-Origin": "*"})
+        except Exception as e:
+            print(f"PCM direct URL error: {e}, falling back to yt-dlp pipeline")
+        return build_pcm_stream_from_ytdlp(vid)
 
-    return build_mp3_stream(audio_url)
+    return stream_mp3_by_path(vid)
 
 if __name__ == "__main__":
     import uvicorn
