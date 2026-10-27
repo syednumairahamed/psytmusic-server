@@ -115,12 +115,12 @@ def extract_audio_url(video_id: str) -> str:
     except Exception as e:
         print(f"Piped proxy extract error: {e}")
 
-    # Tier 3: yt-dlp client extraction
-    clients = [None, ['mweb']] if has_cookies() else [['android'], ['ios'], None]
+    # Tier 3: yt-dlp client extraction with unblocked embedded/creator clients
+    clients = [['visionos'], ['android_creator'], ['ios_creator'], ['tv_embedded'], ['android'], None]
     for client_list in clients:
         try:
             ydl_opts = {
-                'format': 'ba/140/251/250/249/18/b',
+                'format': 'ba/b',
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
@@ -128,7 +128,7 @@ def extract_audio_url(video_id: str) -> str:
                 'nocheckcertificate': True,
                 'socket_timeout': 6,
             }
-            if has_cookies() and (not client_list or client_list[0] not in ['android', 'ios']):
+            if has_cookies():
                 ydl_opts['cookiefile'] = COOKIE_FILE
             if client_list:
                 ydl_opts['extractor_args'] = {'youtube': {'player_client': client_list}}
@@ -420,10 +420,14 @@ def build_mp3_stream(audio_url: str):
     Transcodes resolved YouTube audio URL to strict CBR 128kbps 44.1kHz stereo MP3 for PSP.
     Pre-checks initial bytes to ensure FFmpeg successfully connected.
     """
+    headers = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n"
+    if "googlevideo.com" in audio_url or "youtube.com" in audio_url:
+        headers += "Referer: https://music.youtube.com/\r\n"
+
     ffmpeg_cmd = [
         "ffmpeg",
         "-loglevel", "error",
-        "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\nReferer: https://music.youtube.com/\r\n",
+        "-headers", headers,
         "-reconnect", "1",
         "-reconnect_streamed", "1",
         "-reconnect_delay_max", "5",
@@ -493,10 +497,8 @@ def stream_mp3_invidious_proxy(video_id: str):
     mirrors = [
         "https://inv.nadeko.net",
         "https://invidious.nerdvpn.de",
-        "https://invidious.drgns.space",
-        "https://invidious.lunar.icu",
-        "https://yewtu.be",
-        "https://invidious.private.coffee"
+        "https://invidious.private.coffee",
+        "https://yewtu.be"
     ]
     for itag in ["140", "251", "18"]:
         for m in mirrors:
@@ -505,7 +507,8 @@ def stream_mp3_invidious_proxy(video_id: str):
                 resp = requests.head(url, timeout=2.5, allow_redirects=True, headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
                 })
-                if resp.status_code == 200:
+                ctype = resp.headers.get("Content-Type", "")
+                if resp.status_code == 200 and "html" not in ctype and ("audio" in ctype or "video" in ctype or "octet-stream" in ctype):
                     print(f"Invidious proxy succeeded for {video_id} via {m} (itag {itag})")
                     return build_mp3_stream(url)
             except Exception:
@@ -515,33 +518,29 @@ def stream_mp3_invidious_proxy(video_id: str):
 def stream_mp3_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg.
-    When cookies exist, prioritizes authenticated Web/MWeb clients.
+    Uses unblocked embedded, creator, and vision clients (visionos, android_creator, ios_creator, tv_embedded)
+    which bypass datacenter bot-checks entirely.
     FFmpeg reads pipe:0, eliminating external CDN IP-locks.
     """
-    if has_cookies():
-        client_configs = [
-            [],  # Web client with cookies
-            ["--extractor-args", "youtube:player_client=mweb"],
-            ["--extractor-args", "youtube:player_client=web"]
-        ]
-    else:
-        client_configs = [
-            ["--extractor-args", "youtube:player_client=android"],
-            ["--extractor-args", "youtube:player_client=ios"],
-            []
-        ]
+    client_configs = [
+        ["--extractor-args", "youtube:player_client=visionos"],
+        ["--extractor-args", "youtube:player_client=android_creator"],
+        ["--extractor-args", "youtube:player_client=ios_creator"],
+        ["--extractor-args", "youtube:player_client=tv_embedded"],
+        ["--extractor-args", "youtube:player_client=android"],
+        []
+    ]
+
+    cookie_args = get_cookie_args()
 
     for extra_args in client_configs:
-        is_mobile = any("android" in str(a) or "ios" in str(a) for a in extra_args)
-        cookie_args = [] if is_mobile else get_cookie_args()
-
         ytdlp_cmd = [
             sys.executable, "-m", "yt_dlp",
             "--quiet",
             "--no-warnings",
             "--no-playlist"
         ] + cookie_args + extra_args + [
-            "-f", "ba/140/251/250/249/18/b",
+            "-f", "ba/b",
             "-o", "-",
             f"https://www.youtube.com/watch?v={video_id}"
         ]
@@ -625,31 +624,27 @@ def stream_mp3_ytdlp_pipe(video_id: str):
 def stream_pcm_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg raw PCM (16-bit signed LE 44.1kHz stereo) for PSP bridge mode.
+    Uses unblocked embedded, creator, and vision clients.
     """
-    if has_cookies():
-        client_configs = [
-            [],
-            ["--extractor-args", "youtube:player_client=mweb"],
-            ["--extractor-args", "youtube:player_client=web"]
-        ]
-    else:
-        client_configs = [
-            ["--extractor-args", "youtube:player_client=android"],
-            ["--extractor-args", "youtube:player_client=ios"],
-            []
-        ]
+    client_configs = [
+        ["--extractor-args", "youtube:player_client=visionos"],
+        ["--extractor-args", "youtube:player_client=android_creator"],
+        ["--extractor-args", "youtube:player_client=ios_creator"],
+        ["--extractor-args", "youtube:player_client=tv_embedded"],
+        ["--extractor-args", "youtube:player_client=android"],
+        []
+    ]
+
+    cookie_args = get_cookie_args()
 
     for extra_args in client_configs:
-        is_mobile = any("android" in str(a) or "ios" in str(a) for a in extra_args)
-        cookie_args = [] if is_mobile else get_cookie_args()
-
         ytdlp_cmd = [
             sys.executable, "-m", "yt_dlp",
             "--quiet",
             "--no-warnings",
             "--no-playlist"
         ] + cookie_args + extra_args + [
-            "-f", "ba/140/251/250/249/18/b",
+            "-f", "ba/b",
             "-o", "-",
             f"https://www.youtube.com/watch?v={video_id}"
         ]
