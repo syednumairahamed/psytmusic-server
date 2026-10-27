@@ -115,11 +115,12 @@ def extract_audio_url(video_id: str) -> str:
     except Exception as e:
         print(f"Piped proxy extract error: {e}")
 
-    # Tier 3: yt-dlp Android/iOS client extraction
-    for client_list in [['android'], ['ios'], None]:
+    # Tier 3: yt-dlp client extraction
+    clients = [None, ['mweb']] if has_cookies() else [['android'], ['ios'], None]
+    for client_list in clients:
         try:
             ydl_opts = {
-                'format': 'bestaudio[ext=m4a]/bestaudio/ba/b',
+                'format': 'ba/140/251/250/249/18/b',
                 'quiet': True,
                 'no_warnings': True,
                 'skip_download': True,
@@ -127,7 +128,7 @@ def extract_audio_url(video_id: str) -> str:
                 'nocheckcertificate': True,
                 'socket_timeout': 6,
             }
-            if has_cookies():
+            if has_cookies() and (not client_list or client_list[0] not in ['android', 'ios']):
                 ydl_opts['cookiefile'] = COOKIE_FILE
             if client_list:
                 ydl_opts['extractor_args'] = {'youtube': {'player_client': client_list}}
@@ -138,7 +139,7 @@ def extract_audio_url(video_id: str) -> str:
                 if not audio_url:
                     formats = info.get('formats', [])
                     for f in reversed(formats):
-                        if f.get('vcodec') == 'none' and f.get('url'):
+                        if f.get('url'):
                             audio_url = f.get('url')
                             break
                 if audio_url:
@@ -483,25 +484,64 @@ def build_mp3_stream(audio_url: str):
         }
     )
 
+def stream_mp3_invidious_proxy(video_id: str):
+    """
+    Proxies stream directly from public Invidious instances using local=true.
+    This routes the audio bytes through Invidious instead of Google's datacenter IP-locked CDN,
+    bypassing all bot checks and IP locks.
+    """
+    mirrors = [
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://invidious.drgns.space",
+        "https://invidious.lunar.icu",
+        "https://yewtu.be",
+        "https://invidious.private.coffee"
+    ]
+    for itag in ["140", "251", "18"]:
+        for m in mirrors:
+            try:
+                url = f"{m}/latest_version?id={video_id}&itag={itag}&local=true"
+                resp = requests.head(url, timeout=2.5, allow_redirects=True, headers={
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                })
+                if resp.status_code == 200:
+                    print(f"Invidious proxy succeeded for {video_id} via {m} (itag {itag})")
+                    return build_mp3_stream(url)
+            except Exception:
+                continue
+    return None
+
 def stream_mp3_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg.
-    Iterates through Android client, iOS client, and default to guarantee player extraction on datacenter IPs.
+    When cookies exist, prioritizes authenticated Web/MWeb clients.
     FFmpeg reads pipe:0, eliminating external CDN IP-locks.
     """
-    client_configs = [
-        ["--extractor-args", "youtube:player_client=android"],
-        ["--extractor-args", "youtube:player_client=ios"],
-        []
-    ]
+    if has_cookies():
+        client_configs = [
+            [],  # Web client with cookies
+            ["--extractor-args", "youtube:player_client=mweb"],
+            ["--extractor-args", "youtube:player_client=web"]
+        ]
+    else:
+        client_configs = [
+            ["--extractor-args", "youtube:player_client=android"],
+            ["--extractor-args", "youtube:player_client=ios"],
+            []
+        ]
+
     for extra_args in client_configs:
+        is_mobile = any("android" in str(a) or "ios" in str(a) for a in extra_args)
+        cookie_args = [] if is_mobile else get_cookie_args()
+
         ytdlp_cmd = [
             sys.executable, "-m", "yt_dlp",
             "--quiet",
             "--no-warnings",
             "--no-playlist"
-        ] + get_cookie_args() + extra_args + [
-            "-f", "bestaudio[ext=m4a]/bestaudio/ba/b",
+        ] + cookie_args + extra_args + [
+            "-f", "ba/140/251/250/249/18/b",
             "-o", "-",
             f"https://www.youtube.com/watch?v={video_id}"
         ]
@@ -586,19 +626,30 @@ def stream_pcm_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg raw PCM (16-bit signed LE 44.1kHz stereo) for PSP bridge mode.
     """
-    client_configs = [
-        ["--extractor-args", "youtube:player_client=android"],
-        ["--extractor-args", "youtube:player_client=ios"],
-        []
-    ]
+    if has_cookies():
+        client_configs = [
+            [],
+            ["--extractor-args", "youtube:player_client=mweb"],
+            ["--extractor-args", "youtube:player_client=web"]
+        ]
+    else:
+        client_configs = [
+            ["--extractor-args", "youtube:player_client=android"],
+            ["--extractor-args", "youtube:player_client=ios"],
+            []
+        ]
+
     for extra_args in client_configs:
+        is_mobile = any("android" in str(a) or "ios" in str(a) for a in extra_args)
+        cookie_args = [] if is_mobile else get_cookie_args()
+
         ytdlp_cmd = [
             sys.executable, "-m", "yt_dlp",
             "--quiet",
             "--no-warnings",
             "--no-playlist"
-        ] + get_cookie_args() + extra_args + [
-            "-f", "bestaudio[ext=m4a]/bestaudio/ba/b",
+        ] + cookie_args + extra_args + [
+            "-f", "ba/140/251/250/249/18/b",
             "-o", "-",
             f"https://www.youtube.com/watch?v={video_id}"
         ]
@@ -673,7 +724,16 @@ def stream_mp3_by_path(video_id: str):
         print(f"Streaming {vid} via yt-dlp pipe (SUCCESS)")
         return resp
 
-    # Strategy 2: Extract direct audio URL via yt-dlp on Render and feed to FFmpeg
+    # Strategy 2: Invidious local=true proxy stream (Zero datacenter block)
+    try:
+        resp = stream_mp3_invidious_proxy(vid)
+        if resp:
+            print(f"Streaming {vid} via Invidious proxy (SUCCESS)")
+            return resp
+    except Exception as e:
+        print(f"Strategy 2 Invidious error for {vid}: {e}")
+
+    # Strategy 3: Extract direct audio URL via yt-dlp on Render and feed to FFmpeg
     try:
         audio_url = extract_audio_url(vid)
         if audio_url:
@@ -682,7 +742,7 @@ def stream_mp3_by_path(video_id: str):
                 print(f"Streaming {vid} via resolved URL (SUCCESS)")
                 return resp
     except Exception as e:
-        print(f"Strategy 2 URL transcode error for {vid}: {e}")
+        print(f"Strategy 3 URL transcode error for {vid}: {e}")
 
     # If all strategies fail, return 502 Bad Gateway so PSP immediately triggers PC Bridge fallback
     print(f"CRITICAL: Failed to stream {vid} across all strategies -> Returning HTTP 502")
