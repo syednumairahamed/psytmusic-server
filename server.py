@@ -801,18 +801,62 @@ def build_mp3_stream(audio_url: str):
 
 def stream_mp3_invidious_proxy(video_id: str):
     """
-    Proxies stream directly from public Invidious instances using local=true.
-    This routes the audio bytes through Invidious instead of Google's datacenter IP-locked CDN,
-    bypassing all bot checks and IP locks.
+    Proxies stream directly from public Piped and Invidious API instances.
+    Extracts direct or proxied audio URLs and pipes them to FFmpeg.
+    Bypasses datacenter bot-checks and IP locks entirely.
     """
-    mirrors = [
+    # Tier 1: Piped API proxied streams (hosted on external mirrors, never IP-locked)
+    piped_mirrors = [
+        "https://pipedapi.kavin.rocks",
+        "https://api.piped.privacy.com.de",
+        "https://piped-api.lunar.icu",
+        "https://pipedapi.tokhmi.xyz"
+    ]
+    for m in piped_mirrors:
+        try:
+            r = requests.get(f"{m}/streams/{video_id}", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                for s in data.get("audioStreams", []):
+                    proxy_url = s.get("proxyUrl") or s.get("url")
+                    if proxy_url:
+                        resp = build_mp3_stream(proxy_url)
+                        if resp:
+                            print(f"Piped proxy stream succeeded for {video_id} via {m}")
+                            return resp
+        except Exception:
+            continue
+
+    # Tier 2: Invidious API audio streams
+    invidious_mirrors = [
         "https://inv.nadeko.net",
         "https://invidious.nerdvpn.de",
         "https://invidious.private.coffee",
+        "https://invidious.drgns.space",
+        "https://invidious.einfachzocken.eu",
         "https://yewtu.be"
     ]
+    for m in invidious_mirrors:
+        try:
+            r = requests.get(f"{m}/api/v1/videos/{video_id}", timeout=3)
+            if r.status_code == 200:
+                data = r.json()
+                formats = data.get("adaptiveFormats", []) + data.get("formatStreams", [])
+                for f in formats:
+                    if "audio" in f.get("type", "") and f.get("url"):
+                        stream_url = f["url"]
+                        if stream_url.startswith("/"):
+                            stream_url = f"{m}{stream_url}"
+                        resp = build_mp3_stream(stream_url)
+                        if resp:
+                            print(f"Invidious API stream succeeded for {video_id} via {m}")
+                            return resp
+        except Exception:
+            continue
+
+    # Tier 3: Invidious legacy local proxy
     for itag in ["140", "251", "18"]:
-        for m in mirrors:
+        for m in invidious_mirrors:
             try:
                 url = f"{m}/latest_version?id={video_id}&itag={itag}&local=true"
                 resp = requests.head(url, timeout=2.5, allow_redirects=True, headers={
@@ -820,7 +864,7 @@ def stream_mp3_invidious_proxy(video_id: str):
                 })
                 ctype = resp.headers.get("Content-Type", "")
                 if resp.status_code == 200 and "html" not in ctype and ("audio" in ctype or "video" in ctype or "octet-stream" in ctype):
-                    print(f"Invidious proxy succeeded for {video_id} via {m} (itag {itag})")
+                    print(f"Invidious local proxy succeeded for {video_id} via {m} (itag {itag})")
                     return build_mp3_stream(url)
             except Exception:
                 continue
@@ -829,36 +873,43 @@ def stream_mp3_invidious_proxy(video_id: str):
 def stream_mp3_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg.
-    Uses unblocked embedded, creator, and vision clients (visionos, android_creator, ios_creator, tv_embedded)
-    which bypass datacenter bot-checks entirely.
-    FFmpeg reads pipe:0, eliminating external CDN IP-locks.
+    Tries OAuth2 (TV/web clients), then unauthenticated clients (visionos, android_creator, ios_creator),
+    then cookies. FFmpeg reads pipe:0, eliminating external CDN IP-locks.
     """
+    attempts = []
+
+    # 1. If OAuth is active, try TV/Web clients that match Google's TV OAuth token
     if has_oauth():
-        client_configs = [
-            [],
-            ["--extractor-args", "youtube:player_client=tv_embedded"],
-            ["--extractor-args", "youtube:player_client=android_creator"],
-            ["--extractor-args", "youtube:player_client=visionos"]
-        ]
-    else:
-        client_configs = [
-            ["--extractor-args", "youtube:player_client=visionos"],
-            ["--extractor-args", "youtube:player_client=android_creator"],
-            ["--extractor-args", "youtube:player_client=ios_creator"],
-            ["--extractor-args", "youtube:player_client=tv_embedded"],
-            ["--extractor-args", "youtube:player_client=android"],
-            []
-        ]
+        oauth_base = ["--username", "oauth2", "--password", ""]
+        attempts.extend([
+            oauth_base + ["--extractor-args", "youtube:player_client=tv"],
+            oauth_base + ["--extractor-args", "youtube:player_client=tv_downgraded"],
+            oauth_base + ["--extractor-args", "youtube:player_client=web"],
+            oauth_base + ["--extractor-args", "youtube:player_client=mweb"],
+            oauth_base
+        ])
 
-    cookie_args = get_cookie_args()
+    # 2. Unauthenticated clients (independent of OAuth, bypass bot-check on datacenter IPs)
+    attempts.extend([
+        ["--extractor-args", "youtube:player_client=visionos"],
+        ["--extractor-args", "youtube:player_client=android_creator"],
+        ["--extractor-args", "youtube:player_client=ios_creator"],
+        ["--extractor-args", "youtube:player_client=tv_embedded"],
+        ["--extractor-args", "youtube:player_client=android"],
+        []
+    ])
 
-    for extra_args in client_configs:
+    # 3. Cookies if present
+    if has_cookies():
+        attempts.append(["--cookies", COOKIE_FILE, "--extractor-args", "youtube:player_client=web"])
+
+    for extra_args in attempts:
         ytdlp_cmd = [
             sys.executable, "-m", "yt_dlp",
             "--quiet",
             "--no-warnings",
             "--no-playlist"
-        ] + cookie_args + extra_args + [
+        ] + extra_args + [
             "-f", "ba/b",
             "-o", "-",
             f"https://www.youtube.com/watch?v={video_id}"
@@ -943,34 +994,38 @@ def stream_mp3_ytdlp_pipe(video_id: str):
 def stream_pcm_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg raw PCM (16-bit signed LE 44.1kHz stereo) for PSP bridge mode.
-    Uses unblocked embedded, creator, and vision clients.
+    Tries OAuth2 (TV/web clients), then unauthenticated clients.
     """
+    attempts = []
     if has_oauth():
-        client_configs = [
-            [],
-            ["--extractor-args", "youtube:player_client=tv_embedded"],
-            ["--extractor-args", "youtube:player_client=android_creator"],
-            ["--extractor-args", "youtube:player_client=visionos"]
-        ]
-    else:
-        client_configs = [
-            ["--extractor-args", "youtube:player_client=visionos"],
-            ["--extractor-args", "youtube:player_client=android_creator"],
-            ["--extractor-args", "youtube:player_client=ios_creator"],
-            ["--extractor-args", "youtube:player_client=tv_embedded"],
-            ["--extractor-args", "youtube:player_client=android"],
-            []
-        ]
+        oauth_base = ["--username", "oauth2", "--password", ""]
+        attempts.extend([
+            oauth_base + ["--extractor-args", "youtube:player_client=tv"],
+            oauth_base + ["--extractor-args", "youtube:player_client=tv_downgraded"],
+            oauth_base + ["--extractor-args", "youtube:player_client=web"],
+            oauth_base + ["--extractor-args", "youtube:player_client=mweb"],
+            oauth_base
+        ])
 
-    cookie_args = get_cookie_args()
+    attempts.extend([
+        ["--extractor-args", "youtube:player_client=visionos"],
+        ["--extractor-args", "youtube:player_client=android_creator"],
+        ["--extractor-args", "youtube:player_client=ios_creator"],
+        ["--extractor-args", "youtube:player_client=tv_embedded"],
+        ["--extractor-args", "youtube:player_client=android"],
+        []
+    ])
 
-    for extra_args in client_configs:
+    if has_cookies():
+        attempts.append(["--cookies", COOKIE_FILE, "--extractor-args", "youtube:player_client=web"])
+
+    for extra_args in attempts:
         ytdlp_cmd = [
             sys.executable, "-m", "yt_dlp",
             "--quiet",
             "--no-warnings",
             "--no-playlist"
-        ] + cookie_args + extra_args + [
+        ] + extra_args + [
             "-f", "ba/b",
             "-o", "-",
             f"https://www.youtube.com/watch?v={video_id}"
