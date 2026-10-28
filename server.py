@@ -799,46 +799,114 @@ def build_mp3_stream(audio_url: str):
         }
     )
 
-def stream_mp3_invidious_proxy(video_id: str):
+def build_pcm_stream(audio_url: str):
     """
-    Proxies stream directly from public Piped and Invidious API instances.
-    Extracts direct or proxied audio URLs and pipes them to FFmpeg.
-    Bypasses datacenter bot-checks and IP locks entirely.
+    Transcodes resolved YouTube audio URL to raw signed 16-bit LE 44.1kHz stereo PCM for PSP bridge mode.
     """
-    # Tier 1: Piped API proxied streams (hosted on external mirrors, never IP-locked)
+    headers = "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n"
+    ffmpeg_cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-headers", headers,
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-i", audio_url,
+        "-vn",
+        "-c:a", "pcm_s16le",
+        "-ar", "44100",
+        "-ac", "2",
+        "-f", "s16le",
+        "pipe:1"
+    ]
+
+    proc = subprocess.Popen(
+        ffmpeg_cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=65536
+    )
+
+    try:
+        first_chunk = proc.stdout.read(8192)
+    except Exception:
+        first_chunk = b""
+
+    if not first_chunk:
+        if proc.poll() is None:
+            proc.terminate()
+        return None
+
+    def iterpcm():
+        yield first_chunk
+        try:
+            while True:
+                data = proc.stdout.read(8192)
+                if not data:
+                    break
+                yield data
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+    return StreamingResponse(
+        iterpcm(),
+        media_type="application/octet-stream",
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
+
+def get_proxied_audio_url(video_id: str) -> str:
+    """
+    Finds a working proxied audio stream URL from Piped or Invidious API instances.
+    Never IP-locked, never blocked by datacenter bot checks.
+    """
+    cached = get_cached_url(video_id)
+    if cached:
+        return cached
+
+    # 1. Piped API proxied streams (hosted on external mirrors, never IP-locked)
     piped_mirrors = [
         "https://pipedapi.kavin.rocks",
         "https://api.piped.privacy.com.de",
         "https://piped-api.lunar.icu",
+        "https://pipedapi.leptons.xyz",
+        "https://pipedapi.r4fo.com",
+        "https://pa.il.ax",
+        "https://api-piped.mha.fi",
+        "https://pipedapi.drgns.space",
         "https://pipedapi.tokhmi.xyz"
     ]
     for m in piped_mirrors:
         try:
-            r = requests.get(f"{m}/streams/{video_id}", timeout=3)
+            r = requests.get(f"{m}/streams/{video_id}", timeout=2.5)
             if r.status_code == 200:
                 data = r.json()
                 for s in data.get("audioStreams", []):
                     proxy_url = s.get("proxyUrl") or s.get("url")
                     if proxy_url:
-                        resp = build_mp3_stream(proxy_url)
-                        if resp:
-                            print(f"Piped proxy stream succeeded for {video_id} via {m}")
-                            return resp
+                        set_cached_url(video_id, proxy_url)
+                        print(f"Found proxied stream for {video_id} via {m}")
+                        return proxy_url
         except Exception:
             continue
 
-    # Tier 2: Invidious API audio streams
+    # 2. Invidious API audio streams
     invidious_mirrors = [
         "https://inv.nadeko.net",
         "https://invidious.nerdvpn.de",
         "https://invidious.private.coffee",
         "https://invidious.drgns.space",
         "https://invidious.einfachzocken.eu",
-        "https://yewtu.be"
+        "https://yewtu.be",
+        "https://iv.ggtyler.dev"
     ]
     for m in invidious_mirrors:
         try:
-            r = requests.get(f"{m}/api/v1/videos/{video_id}", timeout=3)
+            r = requests.get(f"{m}/api/v1/videos/{video_id}", timeout=2.5)
             if r.status_code == 200:
                 data = r.json()
                 formats = data.get("adaptiveFormats", []) + data.get("formatStreams", [])
@@ -847,59 +915,41 @@ def stream_mp3_invidious_proxy(video_id: str):
                         stream_url = f["url"]
                         if stream_url.startswith("/"):
                             stream_url = f"{m}{stream_url}"
-                        resp = build_mp3_stream(stream_url)
-                        if resp:
-                            print(f"Invidious API stream succeeded for {video_id} via {m}")
-                            return resp
+                        set_cached_url(video_id, stream_url)
+                        print(f"Found Invidious stream for {video_id} via {m}")
+                        return stream_url
         except Exception:
             continue
 
-    # Tier 3: Invidious legacy local proxy
-    for itag in ["140", "251", "18"]:
-        for m in invidious_mirrors:
-            try:
-                url = f"{m}/latest_version?id={video_id}&itag={itag}&local=true"
-                resp = requests.head(url, timeout=2.5, allow_redirects=True, headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                })
-                ctype = resp.headers.get("Content-Type", "")
-                if resp.status_code == 200 and "html" not in ctype and ("audio" in ctype or "video" in ctype or "octet-stream" in ctype):
-                    print(f"Invidious local proxy succeeded for {video_id} via {m} (itag {itag})")
-                    return build_mp3_stream(url)
-            except Exception:
-                continue
+    return None
+
+def stream_mp3_invidious_proxy(video_id: str):
+    """
+    Proxies stream directly from public Piped and Invidious API instances.
+    Extracts direct or proxied audio URLs and pipes them to FFmpeg.
+    Bypasses datacenter bot-checks and IP locks entirely.
+    """
+    url = get_proxied_audio_url(video_id)
+    if url:
+        return build_mp3_stream(url)
     return None
 
 def stream_mp3_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg.
-    Tries OAuth2 (TV/web clients), then unauthenticated clients (visionos, android_creator, ios_creator),
-    then cookies. FFmpeg reads pipe:0, eliminating external CDN IP-locks.
+    Uses unblocked mobile and creator clients (ios, visionos, android_creator, tv_embedded)
+    which bypass datacenter bot-checks. FFmpeg reads pipe:0, eliminating external CDN IP-locks.
     """
-    attempts = []
-
-    # 1. If OAuth is active, try TV/Web clients that match Google's TV OAuth token
-    if has_oauth():
-        oauth_base = ["--username", "oauth2", "--password", ""]
-        attempts.extend([
-            oauth_base + ["--extractor-args", "youtube:player_client=tv"],
-            oauth_base + ["--extractor-args", "youtube:player_client=tv_downgraded"],
-            oauth_base + ["--extractor-args", "youtube:player_client=web"],
-            oauth_base + ["--extractor-args", "youtube:player_client=mweb"],
-            oauth_base
-        ])
-
-    # 2. Unauthenticated clients (independent of OAuth, bypass bot-check on datacenter IPs)
-    attempts.extend([
+    attempts = [
+        ["--extractor-args", "youtube:player_client=ios"],
         ["--extractor-args", "youtube:player_client=visionos"],
         ["--extractor-args", "youtube:player_client=android_creator"],
         ["--extractor-args", "youtube:player_client=ios_creator"],
         ["--extractor-args", "youtube:player_client=tv_embedded"],
         ["--extractor-args", "youtube:player_client=android"],
         []
-    ])
+    ]
 
-    # 3. Cookies if present
     if has_cookies():
         attempts.append(["--cookies", COOKIE_FILE, "--extractor-args", "youtube:player_client=web"])
 
@@ -994,27 +1044,16 @@ def stream_mp3_ytdlp_pipe(video_id: str):
 def stream_pcm_ytdlp_pipe(video_id: str):
     """
     Direct pipe from yt-dlp to FFmpeg raw PCM (16-bit signed LE 44.1kHz stereo) for PSP bridge mode.
-    Tries OAuth2 (TV/web clients), then unauthenticated clients.
     """
-    attempts = []
-    if has_oauth():
-        oauth_base = ["--username", "oauth2", "--password", ""]
-        attempts.extend([
-            oauth_base + ["--extractor-args", "youtube:player_client=tv"],
-            oauth_base + ["--extractor-args", "youtube:player_client=tv_downgraded"],
-            oauth_base + ["--extractor-args", "youtube:player_client=web"],
-            oauth_base + ["--extractor-args", "youtube:player_client=mweb"],
-            oauth_base
-        ])
-
-    attempts.extend([
+    attempts = [
+        ["--extractor-args", "youtube:player_client=ios"],
         ["--extractor-args", "youtube:player_client=visionos"],
         ["--extractor-args", "youtube:player_client=android_creator"],
         ["--extractor-args", "youtube:player_client=ios_creator"],
         ["--extractor-args", "youtube:player_client=tv_embedded"],
         ["--extractor-args", "youtube:player_client=android"],
         []
-    ])
+    ]
 
     if has_cookies():
         attempts.append(["--cookies", COOKIE_FILE, "--extractor-args", "youtube:player_client=web"])
@@ -1095,20 +1134,23 @@ def stream_mp3_by_path(video_id: str):
     vid = video_id.replace(".mp3", "")
     print(f"--- Audio stream requested for {vid} ---")
 
-    # Strategy 1: Direct yt-dlp -> FFmpeg process pipe (Zero IP-lock, cloud container native)
-    resp = stream_mp3_ytdlp_pipe(vid)
-    if resp:
-        print(f"Streaming {vid} via yt-dlp pipe (SUCCESS)")
-        return resp
-
-    # Strategy 2: Invidious local=true proxy stream (Zero datacenter block)
+    # Strategy 1: Proxied Audio Stream via Piped / Invidious (Fastest, zero datacenter bot-checks, zero IP locks)
     try:
         resp = stream_mp3_invidious_proxy(vid)
         if resp:
-            print(f"Streaming {vid} via Invidious proxy (SUCCESS)")
+            print(f"Streaming {vid} via Audio Proxy (SUCCESS)")
             return resp
     except Exception as e:
-        print(f"Strategy 2 Invidious error for {vid}: {e}")
+        print(f"Strategy 1 Proxy error for {vid}: {e}")
+
+    # Strategy 2: Direct yt-dlp -> FFmpeg process pipe (Zero IP-lock, cloud container native)
+    try:
+        resp = stream_mp3_ytdlp_pipe(vid)
+        if resp:
+            print(f"Streaming {vid} via yt-dlp pipe (SUCCESS)")
+            return resp
+    except Exception as e:
+        print(f"Strategy 2 yt-dlp error for {vid}: {e}")
 
     # Strategy 3: Extract direct audio URL via yt-dlp on Render and feed to FFmpeg
     try:
@@ -1128,6 +1170,20 @@ def stream_mp3_by_path(video_id: str):
 @app.get("/stream/{video_id}.pcm")
 def stream_pcm_by_path(video_id: str):
     vid = video_id.replace(".pcm", "")
+    print(f"--- PCM stream requested for {vid} ---")
+
+    # Strategy 1: Proxied Audio -> FFmpeg PCM (Zero bot check)
+    try:
+        url = get_proxied_audio_url(vid)
+        if url:
+            resp = build_pcm_stream(url)
+            if resp:
+                print(f"Streaming PCM for {vid} via proxy (SUCCESS)")
+                return resp
+    except Exception as e:
+        print(f"Strategy 1 PCM proxy error for {vid}: {e}")
+
+    # Strategy 2: Direct yt-dlp -> FFmpeg PCM pipe
     resp = stream_pcm_ytdlp_pipe(vid)
     if resp:
         return resp
