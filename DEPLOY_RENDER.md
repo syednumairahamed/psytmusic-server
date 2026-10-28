@@ -1,64 +1,79 @@
-# Deploying PSYTMusic Server to Render.com (100% Free & Fast)
+# Deploying Google Drive Music Server to Render.com (100% Free)
 
-Render provides a **free persistent web service** with full native **FFmpeg** support, allowing YouTube audio to be transcoded on-the-fly directly to standard 128kbps CBR MP3 for the Sony PSP's hardware Media Engine (`sceMp3`) without stream timeouts or cuts.
+Render provides a **free, persistent cloud container** with full native **Linux FFmpeg** support. It pulls your FLAC and MP4 songs directly from Google Drive and transcodes them on-the-fly into 192kbps CBR MP3 for your Sony PSP's hardware Media Engine (`sceMp3`), letting your PSP stream your music library from anywhere over Wi-Fi without needing a PC on!
 
 ---
 
-### Step 1: Create a GitHub Repo & Upload Files (No Git installation needed!)
+### Step 1: Create a GitHub Repository
 
-1. Go to [GitHub.com](https://github.com) and click **New Repository** (e.g. name it `psytmusic-server`, keep it Public or Private).
-2. On your empty repository page, click the link: **"uploading an existing file"**.
-3. Open your computer folder:
-   `C:\Users\syedn\Desktop\psptube\render_server\`
-4. Drag and drop these **4 files** into GitHub:
+1. Go to [GitHub.com](https://github.com) and click **New Repository**.
+2. Name it `psytmusic-drive-server` (set it to **Private** or Public).
+3. On your empty repository page, click the link: **"uploading an existing file"**.
+4. Open the folder on your computer:
+   ```
+   C:\Users\syedn\Desktop\psptube\render_server\
+   ```
+5. Drag and drop these **4 files** into GitHub:
    - `Dockerfile`
    - `requirements.txt`
    - `server.py`
    - `render.yaml`
-5. Click **Commit changes**.
+6. Click **Commit changes**.
 
-*(Alternatively, if you have Git installed, you can `git push` the `render_server` folder).*
+*(Note: Never upload your `service_account.json` to a public repository! In Step 3 below, you can safely paste your key into Render's Environment Variables).*
 
 ---
 
 ### Step 2: Deploy on Render.com
 
-1. Go to [dashboard.render.com](https://dashboard.render.com) and log in (sign in with your GitHub account).
-2. Click the blue **New +** button at the top right, then select **Web Service**.
-3. Select **Build and deploy from a Git repository**, find your `psytmusic-server` repository, and click **Connect**.
+1. Go to [dashboard.render.com](https://dashboard.render.com) and sign in with your GitHub account.
+2. Click the blue **New +** button at the top right &rarr; select **Web Service**.
+3. Select **Build and deploy from a Git repository**, choose your `psytmusic-drive-server` repository, and click **Connect**.
 4. Configure the service:
    - **Name:** `psytmusic-server` (or any custom name)
-   - **Runtime:** `Docker` *(Render will automatically detect your `Dockerfile`)*
+   - **Runtime:** `Docker` *(Render auto-detects `Dockerfile`)*
    - **Instance Type:** `Free`
-5. Click **Deploy Web Service** (or **Create Web Service**).
-
-Render will build the Docker container with Linux FFmpeg and launch your streaming server. In about 2 minutes, your URL will be live at:
-`https://your-service-name.onrender.com`
+5. Click **Create Web Service** (or **Deploy Web Service**).
 
 ---
 
-### Step 3: Test in Your Web Browser
+### Step 3: Add Your Google Drive Key (Safe & Encrypted)
 
-Open your new Render URL (`https://your-service-name.onrender.com`) in your web browser:
-1. You will see the **PSYTMusic Server** dashboard with a live search bar.
-2. Type any song (e.g. `Daft Punk`) and click **Search**.
-3. Click **▶ Stream MP3** to verify that FFmpeg transcodes and streams audio instantly.
+You don't need to commit your key to GitHub! You can paste it directly into Render:
+
+1. In your Render Dashboard, click on your service (`psytmusic-server`).
+2. In the left menu, click **Environment**.
+3. Click **Add Environment Variable**:
+   - **Key:** `GOOGLE_SERVICE_ACCOUNT_JSON`
+   - **Value:** Open your `service_account.json` file in Notepad, copy all text, and paste it here.
+4. Click **Save Changes**.
+
+Render will automatically restart the server with your Google Drive credentials loaded!
 
 ---
 
-### Step 4: Configure Your Sony PSP
+### Step 4: Share Your Google Drive Music Folder
 
-You can configure your Render server either by editing `server.txt` on your Memory Stick or directly inside the PSP's Settings menu:
+1. Open your Render Web Service page and click on your live URL (e.g. `https://psytmusic-server.onrender.com`).
+2. You will see the **PSP Google Drive Music Streamer** dashboard.
+3. It will display your **Service Account Email** (e.g. `psp-streamer@...iam.gserviceaccount.com`).
+4. In [Google Drive](https://drive.google.com), right-click your Music folder (with your FLAC & MP4 files) &rarr; **Share** &rarr; paste the email as **Viewer** &rarr; click **Send**.
+5. Back on the dashboard, click **🔄 Rescan Google Drive**.
+6. All your songs will immediately appear! Click **▶ Test Stream** to verify audio playback.
+
+---
+
+### Step 5: Configure Your Sony PSP
 
 #### Option A: Editing `server.txt`
-On your Memory Stick (`ms0:/PSP/GAME/PSYTMUSIC/server.txt`), enter your Render domain:
+On your PSP Memory Stick (`ms0:/PSP/GAME/PSYTMUSIC/server.txt`), enter your Render domain:
 ```
 your-service-name.onrender.com
 ```
 
 #### Option B: From the PSP Interface
 1. Launch **PSYTMusic** on your PSP.
-2. Go to **Settings** -> **Server Address**.
-3. Press **X** to open the on-screen keyboard, enter your Render domain (e.g. `your-service-name.onrender.com`), and press Enter.
+2. Go to **Settings** &rarr; **Server**.
+3. Press **✕** to open the on-screen keyboard, enter your Render domain (e.g. `your-service-name.onrender.com`), and press Enter.
 
-Your PSP will now search YouTube Music over HTTPS and decode the live 128kbps CBR MP3 stream natively with its hardware Media Engine!
+Your PSP will now stream your personal FLAC & MP4 music library over HTTPS and decode the live 192kbps MP3 stream using hardware acceleration!

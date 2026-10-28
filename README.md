@@ -1,14 +1,17 @@
-# PSYTMusic Streaming Server
+# PSYTMusic Google Drive Music Server (Render Cloud)
 
-High-performance YouTube Music streaming and search backend for Sony PSP (`PSYTMusic`).
+High-performance private Google Drive audio streaming and search server with native Linux **FFmpeg** hardware MP3 transcoding for Sony PSP.
 
-- **Live FFmpeg Transcoding:** On-the-fly conversion of YouTube audio to strict 128kbps CBR MP3 (44.1kHz, 16-bit stereo) for Sony PSP hardware Media Engine (`sceMp3`).
-- **YouTube Music API:** Fast search queries via `ytmusicapi` with automatic `yt-dlp` fallback.
-- **Persistent HTTP Audio Streaming:** Native Docker deployment on Render with zero execution timeouts.
+- **Direct Google Drive Integration:** Streams FLAC (lossless), MP4/M4A, MP3, WAV, and OGG files directly from Google Cloud CDN.
+- **Zero Bot-Checks or IP Locks:** Authenticates cleanly with Google Drive API v3 via Service Account key (`service_account.json` or `GOOGLE_SERVICE_ACCOUNT_JSON` env var).
+- **On-the-Fly Hardware MP3 Transcoding:** Linux FFmpeg transcodes audio in real-time to 192kbps 44.1kHz stereo CBR MP3 specifically formatted for the Sony PSP Media Engine (`sceMp3`), keeping the PSP CPU at 0% load.
+- **Persistent HTTP Audio Streaming:** Native Docker deployment on Render with zero execution timeouts or stream disconnects.
 
-## Endpoints
+## API Endpoints
 
-- `GET /health` - Server health and FFmpeg status.
-- `GET /search_txt?q=<query>` - Compact line-delimited format (`id|title|artist|duration`) for PSP.
-- `GET /stream/<video_id>.mp3` - Live 128kbps CBR MP3 audio stream for PSP.
-- `GET /` - Web dashboard for searching and streaming test.
+- `GET /health` or `GET /status` - Server health, Service Account status, and total songs indexed.
+- `GET /search_txt?q=<query>` - Compact line-delimited format (`id|title|artist|duration\n`) for Sony PSP.
+- `GET /search?q=<query>` - Full JSON search results for web frontend.
+- `GET /rescan` - Triggers an immediate in-memory rescan of Google Drive.
+- `GET /stream/<file_id>.mp3` - Live 192kbps CBR MP3 audio stream for Sony PSP.
+- `GET /` - Interactive web management dashboard with HTML5 audio player and live status.
