@@ -50,16 +50,34 @@ SERVICE_ACCOUNT_FILES = [
 drive_service = None
 drive_creds = None
 service_account_email = ""
+service_account_key_id = ""
 
 def load_google_credentials():
-    global drive_service, drive_creds, service_account_email
+    global drive_service, drive_creds, service_account_email, service_account_key_id
     creds_dict = None
 
-    env_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
-    if env_json:
+    env_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_B64", "").strip()
+    env_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    if env_b64:
         try:
-            creds_dict = json.loads(env_json)
-            print("--- Loaded Google Service Account from GOOGLE_SERVICE_ACCOUNT_JSON ---")
+            import base64
+            decoded = base64.b64decode(env_b64).decode("utf-8")
+            creds_dict = json.loads(decoded)
+            print("--- Loaded Google Service Account from GOOGLE_SERVICE_ACCOUNT_B64 ---")
+        except Exception as e:
+            print(f"Warning: Failed to parse GOOGLE_SERVICE_ACCOUNT_B64: {e}")
+
+    if not creds_dict and env_json:
+        try:
+            if not env_json.startswith("{"):
+                import base64
+                decoded = base64.b64decode(env_json).decode("utf-8")
+                creds_dict = json.loads(decoded)
+                print("--- Loaded Google Service Account from Base64 GOOGLE_SERVICE_ACCOUNT_JSON ---")
+            else:
+                creds_dict = json.loads(env_json)
+                print("--- Loaded Google Service Account from GOOGLE_SERVICE_ACCOUNT_JSON ---")
         except Exception as e:
             print(f"Warning: Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
 
@@ -80,6 +98,7 @@ def load_google_credentials():
 
     try:
         service_account_email = creds_dict.get("client_email", "")
+        service_account_key_id = creds_dict.get("private_key_id", "")
 
         # Fix escaped newlines in private_key when passed via cloud environment variables (Render/Heroku/Docker)
         if "private_key" in creds_dict and isinstance(creds_dict["private_key"], str):
@@ -94,7 +113,7 @@ def load_google_credentials():
         scopes = ["https://www.googleapis.com/auth/drive.readonly"]
         drive_creds = service_account.Credentials.from_service_account_info(creds_dict, scopes=scopes)
         drive_service = build("drive", "v3", credentials=drive_creds, cache_discovery=False)
-        print(f"--- Google Drive API Authenticated! Service Email: {service_account_email} ---")
+        print(f"--- Google Drive API Authenticated! Email: {service_account_email} | Active Key ID: {service_account_key_id[:12]}... ---")
         return drive_service
     except ImportError:
         print("ERROR: Google API libraries not installed. Run: pip install google-api-python-client google-auth")
@@ -510,6 +529,7 @@ def health():
         "status": "online",
         "authenticated": drive_service is not None,
         "service_email": service_account_email,
+        "key_id": service_account_key_id,
         "tracks_indexed": len(music_library),
         "folders_found": len(folder_library),
         "is_scanning": is_scanning,
@@ -626,7 +646,8 @@ def index():
     <div class="card" style="border-left: 4px solid #10b981;">
         <h3 style="margin-top:0;">Google Drive Service Account Status</h3>
         <div id="authStatusBox">
-            <p><strong>Service Account Email:</strong> <span class="code-box" id="emailBox">{service_account_email or 'No key found yet'}</span></p>
+            <p><strong>Service Account:</strong> <span class="code-box" id="emailBox">{service_account_email or 'No key found yet'}</span></p>
+            <p><strong>Active Key ID:</strong> <span class="code-box" id="keyBox">{service_account_key_id[:16] + '...' if service_account_key_id else 'None'}</span></p>
             <p style="color:#aaa; font-size:14px;">
                 <strong>Next Step:</strong> Open <a href="https://drive.google.com" target="_blank" style="color:#64b5f6;">Google Drive</a>, right-click your main Music folder &rarr; <strong>Share</strong> &rarr; paste the email above as <strong>Viewer</strong>. All subfolders and nested files are automatically included!
             </p>
@@ -670,6 +691,7 @@ def index():
             const res = await fetch('/status');
             const data = await res.json();
             document.getElementById('emailBox').textContent = data.service_email || 'service_account.json missing';
+            document.getElementById('keyBox').textContent = (data.key_id ? data.key_id.substring(0, 16) + '...' : 'None');
             document.getElementById('songCount').textContent = data.tracks_indexed;
             document.getElementById('folderCount').textContent = data.folders_found;
 
