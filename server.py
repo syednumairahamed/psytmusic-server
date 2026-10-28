@@ -151,109 +151,196 @@ def scan_google_drive():
     new_tracks = []
     folder_map = {}
 
+    seen_ids = set()
+
+    def process_item(item, default_parent=""):
+        file_id = item.get('id', '')
+        if not file_id or file_id in seen_ids:
+            return
+        seen_ids.add(file_id)
+
+        name = item.get('name', 'Unknown')
+        lower = name.lower()
+        mime = item.get('mimeType', '').lower()
+
+        # Catch all audio formats, video/mp4, or explicit audio extensions
+        is_audio = (
+            any(lower.endswith(ext) for ext in AUDIO_EXTENSIONS) or
+            mime.startswith('audio/') or
+            mime == 'video/mp4' or
+            'audio' in mime
+        )
+        if not is_audio:
+            return
+
+        parents = item.get('parents', [])
+        parent_folder_id = parents[0] if parents else (default_parent or "")
+        folder_info = folder_map.get(parent_folder_id, {})
+        folder_name = folder_info.get('name', '')
+        folder_path = folder_info.get('path', folder_name)
+
+        title, artist = parse_filename_meta(name, folder_name)
+        ext = os.path.splitext(name)[1].lower().replace('.', '').upper()
+        if not ext:
+            if mime.startswith('audio/'):
+                ext = mime.split('/')[-1].upper()
+            elif mime == 'video/mp4':
+                ext = "MP4"
+            else:
+                ext = "AUDIO"
+
+        dur_ms = 0
+        vmeta = item.get('videoMediaMetadata')
+        if isinstance(vmeta, dict) and vmeta.get('durationMillis'):
+            try:
+                dur_ms = int(vmeta['durationMillis'])
+            except (ValueError, TypeError):
+                dur_ms = 0
+        duration_str = format_duration(dur_ms / 1000.0) if dur_ms > 0 else "3:45"
+
+        track_obj = {
+            "id": file_id,
+            "name": name,
+            "title": title.replace("|", " "),
+            "artist": f"[{ext}] {artist}".replace("|", " "),
+            "duration": duration_str,
+            "format": ext,
+            "size": int(item.get('size', 0) or 0),
+            "mime": item.get('mimeType', ''),
+            "folder_id": parent_folder_id,
+            "folder_name": folder_name,
+            "folder_path": folder_path
+        }
+        new_tracks.append(track_obj)
+        music_library.clear()
+        music_library.extend(new_tracks)
+        print(f"  + [{ext}] {title} - {artist} ({duration_str})")
+
     try:
+        # Step 1: Discover all items explicitly shared with this service account
+        print("  -> Checking items shared with service account (sharedWithMe)...")
+        shared_page = None
+        while True:
+            try:
+                s_resp = drive_service.files().list(
+                    q="sharedWithMe = true and trashed = false",
+                    fields='nextPageToken, files(id, name, mimeType, size, videoMediaMetadata, parents)',
+                    pageSize=1000,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                    pageToken=shared_page
+                ).execute()
+
+                for item in s_resp.get('files', []):
+                    fid = item['id']
+                    if item.get('mimeType') == 'application/vnd.google-apps.folder':
+                        folder_map[fid] = {
+                            "id": fid,
+                            "name": item.get('name', 'Shared Folder'),
+                            "parent": None
+                        }
+                        print(f"  -> Discovered shared folder: '{item.get('name')}' (ID: {fid})")
+                    else:
+                        process_item(item)
+
+                shared_page = s_resp.get('nextPageToken')
+                if not shared_page:
+                    break
+            except Exception as e:
+                print(f"Notice during sharedWithMe scan: {e}")
+                break
+
+        # Step 2: Also discover any folders in My Drive or Shared Drives
         folder_query = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         page_token = None
         while True:
-            resp = drive_service.files().list(
-                q=folder_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, parents)',
-                pageSize=1000,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True,
-                pageToken=page_token
-            ).execute()
-            for f in resp.get('files', []):
-                fid = f['id']
-                parents = f.get('parents', [])
-                parent_id = parents[0] if parents else None
-                folder_map[fid] = {
-                    "id": fid,
-                    "name": f.get('name', 'Folder'),
-                    "parent": parent_id
-                }
-            page_token = resp.get('nextPageToken')
-            if not page_token:
+            try:
+                resp = drive_service.files().list(
+                    q=folder_query,
+                    fields='nextPageToken, files(id, name, parents)',
+                    pageSize=1000,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                    pageToken=page_token
+                ).execute()
+                for f in resp.get('files', []):
+                    fid = f['id']
+                    parents = f.get('parents', [])
+                    parent_id = parents[0] if parents else None
+                    if fid not in folder_map:
+                        folder_map[fid] = {
+                            "id": fid,
+                            "name": f.get('name', 'Folder'),
+                            "parent": parent_id
+                        }
+                page_token = resp.get('nextPageToken')
+                if not page_token:
+                    break
+            except Exception as fe:
+                print(f"Notice during folder list: {fe}")
                 break
 
+        # Compute full folder paths
         for fid, f_info in folder_map.items():
-            name = f_info['name']
+            name = f_info.get('name', 'Folder')
             curr = f_info
             path_parts = [name]
             depth = 0
             while curr.get('parent') and curr['parent'] in folder_map and depth < 6:
                 curr = folder_map[curr['parent']]
-                path_parts.insert(0, curr['name'])
+                path_parts.insert(0, curr.get('name', 'Folder'))
                 depth += 1
             f_info['path'] = " / ".join(path_parts)
 
-        seen_ids = set()
+        # Step 3: Recursive deep inspection of all discovered folders & subfolders
+        crawl_queue = list(folder_map.keys())
+        visited_folders = set(crawl_queue)
+        print(f"  -> Recursively crawling {len(crawl_queue)} discovered folder hierarchies...")
 
-        def process_item(item, default_parent=""):
-            file_id = item['id']
-            if file_id in seen_ids:
-                return
-            seen_ids.add(file_id)
+        while crawl_queue:
+            curr_fid = crawl_queue.pop(0)
+            curr_folder = folder_map.get(curr_fid, {})
+            curr_name = curr_folder.get('name', 'Folder')
+            sub_page = None
+            while True:
+                try:
+                    sresp = drive_service.files().list(
+                        q=f"'{curr_fid}' in parents and trashed = false",
+                        fields='nextPageToken, files(id, name, mimeType, size, videoMediaMetadata, parents)',
+                        pageSize=1000,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                        pageToken=sub_page
+                    ).execute()
 
-            name = item.get('name', 'Unknown')
-            lower = name.lower()
-            mime = item.get('mimeType', '').lower()
+                    for item in sresp.get('files', []):
+                        if item.get('mimeType') == 'application/vnd.google-apps.folder':
+                            sub_fid = item['id']
+                            if sub_fid not in visited_folders:
+                                visited_folders.add(sub_fid)
+                                crawl_queue.append(sub_fid)
+                                folder_map[sub_fid] = {
+                                    "id": sub_fid,
+                                    "name": item.get('name', 'Subfolder'),
+                                    "parent": curr_fid,
+                                    "path": f"{curr_folder.get('path', curr_name)} / {item.get('name', 'Subfolder')}"
+                                }
+                        else:
+                            process_item(item, default_parent=curr_fid)
 
-            # Catch all audio formats, video/mp4, or explicit audio extensions
-            is_audio = (
-                any(lower.endswith(ext) for ext in AUDIO_EXTENSIONS) or
-                mime.startswith('audio/') or
-                mime == 'video/mp4'
-            )
-            if not is_audio:
-                return
+                    sub_page = sresp.get('nextPageToken')
+                    if not sub_page:
+                        break
+                except Exception as se:
+                    break
 
-            parents = item.get('parents', [])
-            parent_folder_id = parents[0] if parents else (default_parent or "")
-            folder_info = folder_map.get(parent_folder_id, {})
-            folder_name = folder_info.get('name', '')
-            folder_path = folder_info.get('path', folder_name)
-
-            title, artist = parse_filename_meta(name, folder_name)
-            ext = os.path.splitext(name)[1].lower().replace('.', '').upper()
-            if not ext:
-                if mime.startswith('audio/'):
-                    ext = mime.split('/')[-1].upper()
-                elif mime == 'video/mp4':
-                    ext = "MP4"
-                else:
-                    ext = "AUDIO"
-
-            dur_ms = 0
-            vmeta = item.get('videoMediaMetadata')
-            if vmeta and 'durationMillis' in vmeta:
-                dur_ms = int(vmeta['durationMillis'])
-            duration_str = format_duration(dur_ms / 1000.0) if dur_ms > 0 else "3:45"
-
-            new_tracks.append({
-                "id": file_id,
-                "name": name,
-                "title": title.replace("|", " "),
-                "artist": f"[{ext}] {artist}".replace("|", " "),
-                "duration": duration_str,
-                "format": ext,
-                "size": int(item.get('size', 0)),
-                "mime": item.get('mimeType', ''),
-                "folder_id": parent_folder_id,
-                "folder_name": folder_name,
-                "folder_path": folder_path
-            })
-
-        # Step 2: Global non-folder scan across all accessible items
-        # Avoids Google Drive's broken "name contains '.flac'" query tokenization bug
+        # Step 4: Global non-folder scan across any remaining accessible items
         file_query = "mimeType != 'application/vnd.google-apps.folder' and trashed = false"
         page_token = None
         while True:
             try:
                 resp = drive_service.files().list(
                     q=file_query,
-                    spaces='drive',
                     fields='nextPageToken, files(id, name, mimeType, size, videoMediaMetadata, parents)',
                     pageSize=1000,
                     supportsAllDrives=True,
@@ -268,34 +355,9 @@ def scan_google_drive():
                 if not page_token:
                     break
             except Exception as ge:
-                print(f"Notice during global file list: {ge}")
                 break
 
-        # Step 3: Deep inspection of all discovered folders and subfolders
-        # Guarantees files inside shared subfolders that weren't surfaced in global list are crawled
-        for fid in list(folder_map.keys()):
-            sub_page = None
-            while True:
-                try:
-                    sresp = drive_service.files().list(
-                        q=f"'{fid}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
-                        spaces='drive',
-                        fields='nextPageToken, files(id, name, mimeType, size, videoMediaMetadata, parents)',
-                        pageSize=1000,
-                        supportsAllDrives=True,
-                        includeItemsFromAllDrives=True,
-                        pageToken=sub_page
-                    ).execute()
-
-                    for item in sresp.get('files', []):
-                        process_item(item, default_parent=fid)
-
-                    sub_page = sresp.get('nextPageToken')
-                    if not sub_page:
-                        break
-                except Exception as se:
-                    break
-
+        # Step 5: Count tracks per folder and build active folders list
         folder_counts = {}
         for t in new_tracks:
             fid = t.get('folder_id')
@@ -305,16 +367,20 @@ def scan_google_drive():
         active_folders = []
         for fid, count in folder_counts.items():
             f_info = folder_map.get(fid, {"id": fid, "name": "Folder", "path": "Folder"})
+            fname = str(f_info.get('name') or 'Folder')
+            fpath = str(f_info.get('path') or fname)
             active_folders.append({
                 "id": fid,
-                "name": f_info.get('name', 'Folder'),
-                "path": f_info.get('path', 'Folder'),
+                "name": fname,
+                "path": fpath,
                 "count": count
             })
-        active_folders.sort(key=lambda x: x['name'].lower())
+        active_folders.sort(key=lambda x: str(x['name']).lower())
 
-        music_library = new_tracks
-        folder_library = active_folders
+        music_library.clear()
+        music_library.extend(new_tracks)
+        folder_library.clear()
+        folder_library.extend(active_folders)
         last_scan_time = time.time()
         print(f"--- Scan Complete! Found {len(music_library)} audio tracks across {len(folder_library)} folders! ---")
     except Exception as e:
@@ -438,6 +504,7 @@ def health():
         "service_email": service_account_email,
         "tracks_indexed": len(music_library),
         "folders_found": len(folder_library),
+        "is_scanning": is_scanning,
         "last_scan": last_scan_time
     }
 
@@ -589,6 +656,7 @@ def index():
     <script>
         let allSongs = [];
         let allFolders = [];
+        let scanTimer = null;
 
         async function loadStatus() {{
             const res = await fetch('/status');
@@ -596,24 +664,47 @@ def index():
             document.getElementById('emailBox').textContent = data.service_email || 'service_account.json missing';
             document.getElementById('songCount').textContent = data.tracks_indexed;
             document.getElementById('folderCount').textContent = data.folders_found;
+
+            const scanEl = document.getElementById('scanStatus');
+            if (data.is_scanning) {{
+                scanEl.innerHTML = `<span style="color:#60a5fa;">&#128260; Scanning Google Drive... (${{data.tracks_indexed}} songs found so far)</span>`;
+                if (!scanTimer) {{
+                    scanTimer = setInterval(loadSongs, 2000);
+                }}
+            }} else {{
+                if (scanTimer) {{
+                    clearInterval(scanTimer);
+                    scanTimer = null;
+                }}
+                if (data.tracks_indexed > 0) {{
+                    scanEl.innerHTML = `<span style="color:#10b981;">&#9989; Library up to date! (${{data.tracks_indexed}} songs across ${{data.folders_found}} folders)</span>`;
+                }} else {{
+                    scanEl.innerHTML = `<span style="color:#f59e0b;">&#9888;&#65039; 0 tracks found. Please share your Google Drive Music folder with the Service Account email as Viewer and click Rescan.</span>`;
+                }}
+            }}
+            return data;
         }}
 
         async function doRescan() {{
-            document.getElementById('scanStatus').textContent = "Scanning folders & subfolders...";
+            document.getElementById('scanStatus').innerHTML = '<span style="color:#60a5fa;">&#128260; Starting Google Drive scan...</span>';
             await fetch('/rescan');
-            setTimeout(loadSongs, 3000);
+            if (scanTimer) clearInterval(scanTimer);
+            scanTimer = setInterval(loadSongs, 2000);
+            setTimeout(loadSongs, 1000);
         }}
 
         async function loadFolders() {{
             const res = await fetch('/folders');
             allFolders = await res.json();
             const sel = document.getElementById('folderSelect');
+            const currentVal = sel.value;
             sel.innerHTML = '<option value="all">📁 All Folders (' + allSongs.length + ' songs)</option>' +
                 allFolders.map(f => `<option value="${{f.id}}">📁 ${{f.name}} (${{f.count}} songs)</option>`).join('');
+            if (currentVal) sel.value = currentVal;
         }}
 
         async function loadSongs() {{
-            await loadStatus();
+            const status = await loadStatus();
             const res = await fetch('/search');
             allSongs = await res.json();
             document.getElementById('songCount').textContent = allSongs.length;
@@ -625,7 +716,6 @@ def index():
             document.getElementById('rawOutput').textContent = txt;
             const pspLines = txt.trim() ? txt.trim().split('\\n').filter(l => !l.startsWith('none|')) : [];
             document.getElementById('pspSongCount').textContent = pspLines.length;
-            document.getElementById('scanStatus').textContent = "Library up to date!";
         }}
 
         function filterSongs() {{
@@ -643,9 +733,6 @@ def index():
             }});
 
             document.getElementById('displayedCount').textContent = `Showing ${{filtered.length}} of ${{allSongs.length}} songs`;
-            renderSongs(filtered);
-        }}
-
             renderSongs(filtered);
         }}
 
