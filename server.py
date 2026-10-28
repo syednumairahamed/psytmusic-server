@@ -80,6 +80,14 @@ def load_google_credentials():
 
     try:
         service_account_email = creds_dict.get("client_email", "")
+
+        # Fix escaped newlines in private_key when passed via cloud environment variables (Render/Heroku/Docker)
+        if "private_key" in creds_dict and isinstance(creds_dict["private_key"], str):
+            pk = creds_dict["private_key"]
+            if "\\n" in pk:
+                pk = pk.replace("\\n", "\n")
+            creds_dict["private_key"] = pk.strip()
+
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
 
