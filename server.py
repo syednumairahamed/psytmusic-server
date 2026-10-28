@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 import requests
 
-app = FastAPI(title="PSP Google Drive Music Streamer", version="3.0.0")
+app = FastAPI(title="PSP Google Drive Music Streamer", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -26,7 +26,6 @@ app.add_middleware(
 # FFmpeg Detection
 # ---------------------------------------------------------
 def find_ffmpeg() -> str:
-    # Check Linux / standard PATH
     try:
         res = subprocess.run(["ffmpeg", "-version"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode == 0:
@@ -56,7 +55,6 @@ def load_google_credentials():
     global drive_service, drive_creds, service_account_email
     creds_dict = None
 
-    # 1. Check environment variable (ideal for Render deployment)
     env_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
     if env_json:
         try:
@@ -65,7 +63,6 @@ def load_google_credentials():
         except Exception as e:
             print(f"Warning: Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON: {e}")
 
-    # 2. Check local files
     if not creds_dict:
         for fpath in SERVICE_ACCOUNT_FILES:
             if os.path.exists(fpath) and os.path.getsize(fpath) > 20:
@@ -101,18 +98,23 @@ def load_google_credentials():
 load_google_credentials()
 
 # ---------------------------------------------------------
-# Music Library In-Memory Cache & Indexer
+# Music Library In-Memory Cache & Recursive Folder Indexer
 # ---------------------------------------------------------
 music_library: List[Dict] = []
 folder_library: List[Dict] = []
 last_scan_time = 0
 is_scanning = False
 
-AUDIO_EXTENSIONS = ('.flac', '.mp4', '.m4a', '.mp3', '.wav', '.ogg', '.aac', '.opus', '.alac', '.aiff')
+AUDIO_EXTENSIONS = (
+    '.flac', '.mp4', '.m4a', '.mp3', '.wav', '.ogg', '.aac',
+    '.opus', '.alac', '.aiff', '.wma', '.m4v', '.ape', '.dsf',
+    '.dff', '.flv', '.mka', '.webm'
+)
 
-def parse_filename_meta(filename: str) -> (str, str):
+def parse_filename_meta(filename: str, folder_name: str = "") -> (str, str):
     base, _ = os.path.splitext(filename)
     base = base.replace("_", " ").strip()
+    fallback_artist = folder_name if folder_name else "Google Drive"
 
     if " - " in base:
         parts = base.split(" - ", 1)
@@ -124,9 +126,9 @@ def parse_filename_meta(filename: str) -> (str, str):
 
     if len(base) > 3 and base[:2].isdigit() and base[2] in " .-_":
         title = base[3:].strip()
-        return title[:64], "Google Drive"
+        return title[:64], fallback_artist[:48]
 
-    return base[:64], "Google Drive"
+    return base[:64], fallback_artist[:48]
 
 def format_duration(seconds: float) -> str:
     if not seconds or seconds <= 0:
@@ -145,9 +147,9 @@ def scan_google_drive():
             return
 
     is_scanning = True
-    print("--- Scanning Google Drive for Music (FLAC, MP4, MP3, etc.) ---")
+    print("--- Scanning Google Drive for Music across all Folders & Subfolders ---")
     new_tracks = []
-    new_folders = []
+    folder_map = {}
 
     try:
         folder_query = "mimeType = 'application/vnd.google-apps.folder' and trashed = false"
@@ -157,77 +159,164 @@ def scan_google_drive():
                 q=folder_query,
                 spaces='drive',
                 fields='nextPageToken, files(id, name, parents)',
-                pageSize=100,
+                pageSize=1000,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
                 pageToken=page_token
             ).execute()
             for f in resp.get('files', []):
-                new_folders.append({"id": f['id'], "name": f['name']})
+                fid = f['id']
+                parents = f.get('parents', [])
+                parent_id = parents[0] if parents else None
+                folder_map[fid] = {
+                    "id": fid,
+                    "name": f.get('name', 'Folder'),
+                    "parent": parent_id
+                }
             page_token = resp.get('nextPageToken')
             if not page_token:
                 break
 
-        query_parts = [
-            "trashed = false",
-            "(" + " or ".join([
-                "mimeType contains 'audio/'",
-                "mimeType = 'video/mp4'",
-                "name contains '.flac'",
-                "name contains '.mp4'",
-                "name contains '.m4a'",
-                "name contains '.mp3'",
-                "name contains '.wav'",
-                "name contains '.ogg'"
-            ]) + ")"
-        ]
-        file_query = " and ".join(query_parts)
+        for fid, f_info in folder_map.items():
+            name = f_info['name']
+            curr = f_info
+            path_parts = [name]
+            depth = 0
+            while curr.get('parent') and curr['parent'] in folder_map and depth < 6:
+                curr = folder_map[curr['parent']]
+                path_parts.insert(0, curr['name'])
+                depth += 1
+            f_info['path'] = " / ".join(path_parts)
 
-        page_token = None
-        while True:
-            resp = drive_service.files().list(
-                q=file_query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, mimeType, size, videoMediaMetadata, parents)',
-                pageSize=100,
-                pageToken=page_token
-            ).execute()
+        seen_ids = set()
 
-            for item in resp.get('files', []):
-                name = item.get('name', 'Unknown')
-                lower = name.lower()
-                if not any(lower.endswith(ext) for ext in AUDIO_EXTENSIONS):
-                    if not item.get('mimeType', '').startswith('audio/') and item.get('mimeType') != 'video/mp4':
-                        continue
+        def process_item(item, default_parent=""):
+            file_id = item['id']
+            if file_id in seen_ids:
+                return
+            seen_ids.add(file_id)
 
-                title, artist = parse_filename_meta(name)
-                ext = os.path.splitext(name)[1].lower().replace('.', '').upper()
-                if not ext:
+            name = item.get('name', 'Unknown')
+            lower = name.lower()
+            mime = item.get('mimeType', '').lower()
+
+            # Catch all audio formats, video/mp4, or explicit audio extensions
+            is_audio = (
+                any(lower.endswith(ext) for ext in AUDIO_EXTENSIONS) or
+                mime.startswith('audio/') or
+                mime == 'video/mp4'
+            )
+            if not is_audio:
+                return
+
+            parents = item.get('parents', [])
+            parent_folder_id = parents[0] if parents else (default_parent or "")
+            folder_info = folder_map.get(parent_folder_id, {})
+            folder_name = folder_info.get('name', '')
+            folder_path = folder_info.get('path', folder_name)
+
+            title, artist = parse_filename_meta(name, folder_name)
+            ext = os.path.splitext(name)[1].lower().replace('.', '').upper()
+            if not ext:
+                if mime.startswith('audio/'):
+                    ext = mime.split('/')[-1].upper()
+                elif mime == 'video/mp4':
+                    ext = "MP4"
+                else:
                     ext = "AUDIO"
 
-                dur_ms = 0
-                vmeta = item.get('videoMediaMetadata')
-                if vmeta and 'durationMillis' in vmeta:
-                    dur_ms = int(vmeta['durationMillis'])
-                duration_str = format_duration(dur_ms / 1000.0) if dur_ms > 0 else "3:45"
+            dur_ms = 0
+            vmeta = item.get('videoMediaMetadata')
+            if vmeta and 'durationMillis' in vmeta:
+                dur_ms = int(vmeta['durationMillis'])
+            duration_str = format_duration(dur_ms / 1000.0) if dur_ms > 0 else "3:45"
 
-                new_tracks.append({
-                    "id": item['id'],
-                    "name": name,
-                    "title": title.replace("|", " "),
-                    "artist": f"[{ext}] {artist}".replace("|", " "),
-                    "duration": duration_str,
-                    "format": ext,
-                    "size": int(item.get('size', 0)),
-                    "mime": item.get('mimeType', '')
-                })
+            new_tracks.append({
+                "id": file_id,
+                "name": name,
+                "title": title.replace("|", " "),
+                "artist": f"[{ext}] {artist}".replace("|", " "),
+                "duration": duration_str,
+                "format": ext,
+                "size": int(item.get('size', 0)),
+                "mime": item.get('mimeType', ''),
+                "folder_id": parent_folder_id,
+                "folder_name": folder_name,
+                "folder_path": folder_path
+            })
 
-            page_token = resp.get('nextPageToken')
-            if not page_token:
+        # Step 2: Global non-folder scan across all accessible items
+        # Avoids Google Drive's broken "name contains '.flac'" query tokenization bug
+        file_query = "mimeType != 'application/vnd.google-apps.folder' and trashed = false"
+        page_token = None
+        while True:
+            try:
+                resp = drive_service.files().list(
+                    q=file_query,
+                    spaces='drive',
+                    fields='nextPageToken, files(id, name, mimeType, size, videoMediaMetadata, parents)',
+                    pageSize=1000,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True,
+                    pageToken=page_token
+                ).execute()
+
+                for item in resp.get('files', []):
+                    process_item(item)
+
+                page_token = resp.get('nextPageToken')
+                if not page_token:
+                    break
+            except Exception as ge:
+                print(f"Notice during global file list: {ge}")
                 break
 
+        # Step 3: Deep inspection of all discovered folders and subfolders
+        # Guarantees files inside shared subfolders that weren't surfaced in global list are crawled
+        for fid in list(folder_map.keys()):
+            sub_page = None
+            while True:
+                try:
+                    sresp = drive_service.files().list(
+                        q=f"'{fid}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false",
+                        spaces='drive',
+                        fields='nextPageToken, files(id, name, mimeType, size, videoMediaMetadata, parents)',
+                        pageSize=1000,
+                        supportsAllDrives=True,
+                        includeItemsFromAllDrives=True,
+                        pageToken=sub_page
+                    ).execute()
+
+                    for item in sresp.get('files', []):
+                        process_item(item, default_parent=fid)
+
+                    sub_page = sresp.get('nextPageToken')
+                    if not sub_page:
+                        break
+                except Exception as se:
+                    break
+
+        folder_counts = {}
+        for t in new_tracks:
+            fid = t.get('folder_id')
+            if fid:
+                folder_counts[fid] = folder_counts.get(fid, 0) + 1
+
+        active_folders = []
+        for fid, count in folder_counts.items():
+            f_info = folder_map.get(fid, {"id": fid, "name": "Folder", "path": "Folder"})
+            active_folders.append({
+                "id": fid,
+                "name": f_info.get('name', 'Folder'),
+                "path": f_info.get('path', 'Folder'),
+                "count": count
+            })
+        active_folders.sort(key=lambda x: x['name'].lower())
+
         music_library = new_tracks
-        folder_library = new_folders
+        folder_library = active_folders
         last_scan_time = time.time()
-        print(f"--- Scan Complete! Found {len(music_library)} audio tracks across {len(folder_library)} folders ---")
+        print(f"--- Scan Complete! Found {len(music_library)} audio tracks across {len(folder_library)} folders! ---")
     except Exception as e:
         print(f"Error scanning Google Drive: {e}")
     finally:
@@ -236,7 +325,7 @@ def scan_google_drive():
 threading.Thread(target=scan_google_drive, daemon=True).start()
 
 # ---------------------------------------------------------
-# Google Drive Direct Stream -> FFmpeg MP3 Transcoder
+# Google Drive Stream -> FFmpeg MP3 Transcoder
 # ---------------------------------------------------------
 def get_drive_auth_token() -> str:
     global drive_creds
@@ -355,38 +444,68 @@ def health():
 @app.get("/rescan")
 def rescan():
     threading.Thread(target=scan_google_drive, daemon=True).start()
-    return {"status": "scanning", "message": "Rescanning Google Drive for music files..."}
+    return {"status": "scanning", "message": "Rescanning Google Drive for music files and subfolders..."}
+
+@app.get("/folders")
+def api_folders():
+    return folder_library
+
+@app.get("/folders_txt", response_class=PlainTextResponse)
+def api_folders_txt():
+    """
+    Returns line-delimited folders for Sony PSP Playlists tab:
+    id|Folder Name|track_count
+    """
+    if not folder_library:
+        return "all|All Songs (Library)|0"
+    lines = ["all|All Songs (All Folders)|" + str(len(music_library))]
+    for f in folder_library[:25]:
+        lines.append(f"{f['id']}|{f['name']}|{f['count']} songs")
+    return "\n".join(lines)
 
 @app.get("/search_txt", response_class=PlainTextResponse)
-def api_search_txt(q: str = ""):
+def api_search_txt(q: str = "", folder: str = "", limit: int = 250):
     if not music_library:
         if not drive_service:
             return "none|No Service Account Key|Add service_account.json|0:00"
         return "none|Library Empty or Scanning|Upload FLAC/MP4 & click Rescan|0:00"
 
+    items = music_library
+    folder_filter = folder.strip()
+    if folder_filter and folder_filter != "all":
+        items = [s for s in items if s.get('folder_id') == folder_filter or folder_filter.lower() in s.get('folder_name', '').lower()]
+
     results = []
     query = q.strip().lower()
     if query:
-        for item in music_library:
+        for item in items:
             if (query in item['title'].lower() or
                 query in item['artist'].lower() or
-                query in item['name'].lower()):
+                query in item['name'].lower() or
+                query in item.get('folder_name', '').lower()):
                 results.append(item)
     else:
-        results = music_library
+        results = items
 
     if not results:
         return f"none|No songs matching: {q[:20]}|Check spelling or Rescan|0:00"
 
-    lines = [f"{s['id']}|{s['title']}|{s['artist']}|{s['duration']}" for s in results[:50]]
+    if limit > 0:
+        results = results[:limit]
+    lines = [f"{s['id']}|{s['title']}|{s['artist']}|{s['duration']}" for s in results]
     return "\n".join(lines)
 
 @app.get("/search")
-def api_search(q: str = ""):
+def api_search(q: str = "", folder: str = "", limit: int = 0):
+    items = music_library
+    if folder and folder != "all":
+        items = [s for s in items if s.get('folder_id') == folder or folder.lower() in s.get('folder_name', '').lower()]
     query = q.strip().lower()
-    if not query:
-        return music_library[:100]
-    return [s for s in music_library if query in s['title'].lower() or query in s['artist'].lower() or query in s['name'].lower()][:100]
+    if query:
+        items = [s for s in items if query in s['title'].lower() or query in s['artist'].lower() or query in s['name'].lower() or query in s.get('folder_name', '').lower()]
+    if limit > 0:
+        return items[:limit]
+    return items
 
 @app.get("/stream/{file_id}.mp3")
 @app.get("/stream/{file_id}")
@@ -408,7 +527,8 @@ def index():
         h1 {{ color: #0070d1; margin-bottom: 4px; display: flex; align-items: center; gap: 10px; }}
         .badge {{ background: #1b5e20; color: #a5d6a7; padding: 4px 10px; border-radius: 12px; font-size: 13px; font-weight: bold; }}
         .card {{ background: #16181f; padding: 22px; border-radius: 10px; margin: 20px 0; border: 1px solid #272a38; }}
-        input[type=text] {{ width: 70%; padding: 12px 16px; font-size: 16px; border-radius: 6px; border: 1px solid #444; background: #222; color: #fff; box-sizing: border-box; }}
+        input[type=text], select {{ padding: 12px 16px; font-size: 15px; border-radius: 6px; border: 1px solid #444; background: #222; color: #fff; box-sizing: border-box; }}
+        input[type=text] {{ flex-grow: 1; }}
         button {{ padding: 12px 24px; font-size: 15px; border-radius: 6px; border: none; background: #0070d1; color: #fff; cursor: pointer; font-weight: bold; transition: background 0.2s; }}
         button:hover {{ background: #0088ff; }}
         .btn-green {{ background: #10b981; }}
@@ -417,6 +537,7 @@ def index():
         .item {{ display: flex; align-items: center; justify-content: space-between; margin: 10px 0; padding: 12px 16px; background: #1f222e; border-radius: 8px; border: 1px solid #2e3347; }}
         .title {{ font-weight: bold; margin-bottom: 4px; font-size: 15px; color: #fff; }}
         .artist {{ color: #94a3b8; font-size: 13px; }}
+        .folder-tag {{ background: #1e293b; color: #cbd5e1; padding: 2px 8px; border-radius: 4px; font-size: 11px; margin-left: 8px; border: 1px solid #334155; }}
         .format-badge {{ background: #3b82f6; color: #fff; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; margin-right: 8px; }}
         .raw-box {{ background: #060709; border: 1px solid #333; padding: 14px; border-radius: 6px; font-family: monospace; font-size: 13px; white-space: pre-wrap; color: #4af626; max-height: 180px; overflow-y: auto; }}
         audio {{ width: 100%; margin-top: 15px; }}
@@ -426,12 +547,13 @@ def index():
     <h1>PSP Google Drive Music Streamer <span class="badge">ONLINE</span></h1>
     <p>High-fidelity FLAC & MP4 on-the-fly hardware MP3 transcoding bridge for Sony PSP.</p>
 
+    <!-- Google Drive Connection Status Card -->
     <div class="card" style="border-left: 4px solid #10b981;">
         <h3 style="margin-top:0;">Google Drive Service Account Status</h3>
         <div id="authStatusBox">
             <p><strong>Service Account Email:</strong> <span class="code-box" id="emailBox">{service_account_email or 'No key found yet'}</span></p>
             <p style="color:#aaa; font-size:14px;">
-                <strong>Next Step:</strong> Open <a href="https://drive.google.com" target="_blank" style="color:#64b5f6;">Google Drive</a>, right-click your Music folder &rarr; <strong>Share</strong> &rarr; paste the email above as <strong>Viewer</strong>.
+                <strong>Next Step:</strong> Open <a href="https://drive.google.com" target="_blank" style="color:#64b5f6;">Google Drive</a>, right-click your main Music folder &rarr; <strong>Share</strong> &rarr; paste the email above as <strong>Viewer</strong>. All subfolders and nested files are automatically included!
             </p>
             <div style="display:flex; gap:12px; margin-top:14px;">
                 <button class="btn-green" onclick="doRescan()">&#128260; Rescan Google Drive</button>
@@ -440,17 +562,22 @@ def index():
         </div>
     </div>
 
+    <!-- Music Library Browser & Audio Player -->
     <div class="card">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
-            <h3>Music Library (<span id="songCount">0</span> songs found)</h3>
+        <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+            <h3 style="margin:0;">Music Library (<span id="songCount">0</span> songs across <span id="folderCount">0</span> folders)</h3>
+            <span id="displayedCount" style="color:#10b981; font-weight:bold; font-size:14px;"></span>
         </div>
 
-        <div style="display: flex; gap: 10px; margin-bottom: 20px;">
-            <input type="text" id="query" placeholder="Filter songs by title, artist, or format..." oninput="filterSongs()">
-            <button onclick="filterSongs()">Search</button>
+        <div style="display: flex; gap: 10px; margin: 20px 0; flex-wrap: wrap;">
+            <select id="folderSelect" onchange="filterSongs()" style="min-width: 220px;">
+                <option value="all">📁 All Folders</option>
+            </select>
+            <input type="text" id="query" placeholder="Filter songs by title, artist, or folder..." oninput="filterSongs()">
+            <button onclick="filterSongs()">Filter</button>
         </div>
 
-        <h4>Raw PSP Response (<code>/search_txt</code> format):</h4>
+        <h4>Raw PSP Response (<code>/search_txt</code> format &bull; <span id="pspSongCount">0</span> tracks sent to PSP):</h4>
         <div id="rawOutput" class="raw-box">Loading songs...</div>
 
         <h4 style="margin-top:25px;">Web Audio Player (Verify Transcoder):</h4>
@@ -461,52 +588,80 @@ def index():
 
     <script>
         let allSongs = [];
+        let allFolders = [];
 
         async function loadStatus() {{
             const res = await fetch('/status');
             const data = await res.json();
             document.getElementById('emailBox').textContent = data.service_email || 'service_account.json missing';
             document.getElementById('songCount').textContent = data.tracks_indexed;
+            document.getElementById('folderCount').textContent = data.folders_found;
         }}
 
         async function doRescan() {{
-            document.getElementById('scanStatus').textContent = "Scanning Drive...";
+            document.getElementById('scanStatus').textContent = "Scanning folders & subfolders...";
             await fetch('/rescan');
-            setTimeout(loadSongs, 2500);
+            setTimeout(loadSongs, 3000);
+        }}
+
+        async function loadFolders() {{
+            const res = await fetch('/folders');
+            allFolders = await res.json();
+            const sel = document.getElementById('folderSelect');
+            sel.innerHTML = '<option value="all">📁 All Folders (' + allSongs.length + ' songs)</option>' +
+                allFolders.map(f => `<option value="${{f.id}}">📁 ${{f.name}} (${{f.count}} songs)</option>`).join('');
         }}
 
         async function loadSongs() {{
-            loadStatus();
+            await loadStatus();
             const res = await fetch('/search');
             allSongs = await res.json();
             document.getElementById('songCount').textContent = allSongs.length;
-            renderSongs(allSongs);
+            await loadFolders();
+            filterSongs();
 
             const txtRes = await fetch('/search_txt');
-            document.getElementById('rawOutput').textContent = await txtRes.text();
+            const txt = await txtRes.text();
+            document.getElementById('rawOutput').textContent = txt;
+            const pspLines = txt.trim() ? txt.trim().split('\\n').filter(l => !l.startsWith('none|')) : [];
+            document.getElementById('pspSongCount').textContent = pspLines.length;
             document.getElementById('scanStatus').textContent = "Library up to date!";
         }}
 
         function filterSongs() {{
             const q = document.getElementById('query').value.toLowerCase();
-            const filtered = allSongs.filter(s =>
-                s.title.toLowerCase().includes(q) ||
-                s.artist.toLowerCase().includes(q) ||
-                s.name.toLowerCase().includes(q)
-            );
+            const selectedFolder = document.getElementById('folderSelect').value;
+
+            const filtered = allSongs.filter(s => {{
+                const matchesFolder = (selectedFolder === 'all') || (s.folder_id === selectedFolder);
+                const matchesQuery = !q ||
+                    s.title.toLowerCase().includes(q) ||
+                    s.artist.toLowerCase().includes(q) ||
+                    s.name.toLowerCase().includes(q) ||
+                    (s.folder_name && s.folder_name.toLowerCase().includes(q));
+                return matchesFolder && matchesQuery;
+            }});
+
+            document.getElementById('displayedCount').textContent = `Showing ${{filtered.length}} of ${{allSongs.length}} songs`;
+            renderSongs(filtered);
+        }}
+
             renderSongs(filtered);
         }}
 
         function renderSongs(list) {{
             const div = document.getElementById('results');
             if (list.length === 0) {{
-                div.innerHTML = "<p style='color:#888;'>No tracks found. Upload FLAC or MP4 files to your shared Google Drive folder and click Rescan.</p>";
+                div.innerHTML = "<p style='color:#888;'>No tracks found in this selection. Make sure your Music folder is shared with the Service Account email and click Rescan.</p>";
                 return;
             }}
             div.innerHTML = list.map(s => `
                 <div class="item">
                     <div>
-                        <div class="title"><span class="format-badge">${{s.format}}</span>${{s.title}}</div>
+                        <div class="title">
+                            <span class="format-badge">${{s.format}}</span>${{s.title}}
+                            ${{s.folder_name ? `<span class="folder-tag">📁 ${{s.folder_name}}</span>` : ''}}
+                        </div>
                         <div class="artist">${{s.artist}} &bull; ${{s.duration}} &bull; ${{s.name}}</div>
                     </div>
                     <button onclick="playSong('${{s.id}}', '${{s.title.replace(/'/g, "\\\\'")}}')">&#9654; Test Stream</button>
